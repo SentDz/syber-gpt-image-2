@@ -48,6 +48,24 @@ export type HistoryItem = {
   updated_at: string;
 };
 
+export type ImageTask = {
+  id: string;
+  owner_id: string;
+  mode: 'generate' | 'edit';
+  prompt: string;
+  model: string;
+  size: string;
+  quality: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  error: string | null;
+  items: HistoryItem[];
+  result: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+};
+
 export type InspirationItem = {
   id: string;
   source_url: string;
@@ -303,7 +321,7 @@ export function deleteHistory(id: string) {
 }
 
 export function generateImage(payload: GeneratePayload) {
-  return request<{ items: HistoryItem[]; provider: Record<string, unknown> }>('/api/images/generate', {
+  return request<ImageTask>('/api/images/generate', {
     method: 'POST',
     body: JSON.stringify({ n: 1, ...payload }),
   });
@@ -317,10 +335,47 @@ export function editImage(payload: GeneratePayload, image: File) {
   if (payload.quality) form.set('quality', payload.quality);
   form.set('n', String(payload.n || 1));
   form.set('image', image);
-  return request<{ items: HistoryItem[]; provider: Record<string, unknown> }>('/api/images/edit', {
+  return request<ImageTask>('/api/images/edit', {
     method: 'POST',
     body: form,
   });
+}
+
+export function getImageTask(taskId: string) {
+  return request<ImageTask>(`/api/tasks/${taskId}`);
+}
+
+export function listImageTasks(params: { limit?: number; status?: string[] } = {}) {
+  const search = new URLSearchParams();
+  if (params.limit) search.set('limit', String(params.limit));
+  if (params.status && params.status.length > 0) search.set('status', params.status.join(','));
+  const query = search.toString();
+  return request<{ items: ImageTask[] }>(`/api/tasks${query ? `?${query}` : ''}`);
+}
+
+export async function waitForImageTask(
+  taskId: string,
+  options: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    onUpdate?: (task: ImageTask) => void;
+  } = {},
+) {
+  const intervalMs = options.intervalMs ?? 1500;
+  const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+  const startedAt = Date.now();
+
+  while (true) {
+    const task = await getImageTask(taskId);
+    options.onUpdate?.(task);
+    if (task.status === 'succeeded' || task.status === 'failed') {
+      return task;
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error('Image task polling timed out');
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
 }
 
 export function formatBalance(balance: BalanceInfo | undefined) {

@@ -4,12 +4,22 @@ import { editImage, generateImage, getHistory, getInspirations, getInspirationSt
 import { useAuth } from '../auth';
 import ImagePreviewModal from '../components/ImagePreviewModal';
 import { useSite } from '../site';
+import { useTasks } from '../tasks';
 
 const FEED_PAGE_SIZE = 24;
+
+function mergeHistory(items: HistoryItem[]) {
+  const merged = new Map<string, HistoryItem>();
+  for (const item of items) {
+    merged.set(item.id, item);
+  }
+  return [...merged.values()].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
 
 export default function Home() {
   const { viewer } = useAuth();
   const { t } = useSite();
+  const { addTask, openDrawer, taskHistoryItems } = useTasks();
   const [promptValue, setPromptValue] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [inspirations, setInspirations] = useState<InspirationItem[]>([]);
@@ -111,12 +121,13 @@ export default function Home() {
     setError('');
     setMessage(selectedFile ? t('home_message_edit_sent') : t('home_message_generate_sent'));
     try {
-      const response = selectedFile
+      const submittedTask = selectedFile
         ? await editImage({ prompt }, selectedFile)
         : await generateImage({ prompt });
-      setHistory((items) => [...response.items, ...items]);
+      addTask(submittedTask);
+      openDrawer();
+      setMessage(submittedTask.status === 'running' ? t('home_message_processing') : t('home_message_queued'));
       setSelectedFile(null);
-      setMessage(t('home_message_saved'));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMessage('');
@@ -125,7 +136,12 @@ export default function Home() {
     }
   }
 
-  const generatedFeed = history.map((item) => ({
+  const mergedHistory = mergeHistory([
+    ...taskHistoryItems.filter((item) => item.status === 'succeeded' && Boolean(item.image_url)),
+    ...history,
+  ]);
+
+  const generatedFeed = mergedHistory.map((item) => ({
         id: `ID:${item.id.slice(0, 4).toUpperCase()}`,
         img: item.image_url || '',
         prompt: item.prompt,

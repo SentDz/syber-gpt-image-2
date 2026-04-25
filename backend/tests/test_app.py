@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ class FakeProvider:
         return {"ok": True, "remaining": 12.5, "raw": {"remaining": 12.5, "unit": "USD"}}
 
     async def generate_image(self, config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(0.02)
         assert payload["model"] == "gpt-image-2"
         return {"created": 123, "data": [{"b64_json": PNG_B64, "revised_prompt": "revised"}], "usage": {"total_tokens": 1}}
 
@@ -33,6 +36,7 @@ class FakeProvider:
         images: list[tuple[str, bytes, str]],
         mask: tuple[str, bytes, str] | None = None,
     ) -> dict[str, Any]:
+        await asyncio.sleep(0.02)
         assert images
         return {"created": 124, "data": [{"b64_json": PNG_B64}], "usage": {"total_tokens": 2}}
 
@@ -127,148 +131,168 @@ def make_client(tmp_path: Path, auth_client: FakeAuthClient | None = None) -> Te
     return TestClient(make_app(tmp_path, auth_client=auth_client))
 
 
+def wait_for_task(client: TestClient, task_id: str, attempts: int = 60, delay: float = 0.02) -> dict[str, Any]:
+    for _ in range(attempts):
+        response = client.get(f"/api/tasks/{task_id}")
+        assert response.status_code == 200
+        task = response.json()
+        if task["status"] in {"succeeded", "failed"}:
+            return task
+        time.sleep(delay)
+    raise AssertionError(f"Task {task_id} did not finish in time")
+
+
 def test_guest_config_masks_api_key(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    response = client.put("/api/config", json={"api_key": "sk-test-123456", "user_name": "Neo"})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["api_key_set"] is True
-    assert data["api_key_hint"] == "sk-tes...3456"
-    assert data["user_name"] == "Neo"
-    assert data["managed_by_auth"] is False
+    with make_client(tmp_path) as client:
+        response = client.put("/api/config", json={"api_key": "sk-test-123456", "user_name": "Neo"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["api_key_set"] is True
+        assert data["api_key_hint"] == "sk-tes...3456"
+        assert data["user_name"] == "Neo"
+        assert data["managed_by_auth"] is False
 
 
 def test_guest_history_is_isolated_by_cookie(tmp_path: Path) -> None:
     app = make_app(tmp_path)
-    client_a = TestClient(app)
-    client_b = TestClient(app)
+    with TestClient(app) as client_a, TestClient(app) as client_b:
+        client_a.put("/api/config", json={"api_key": "sk-test-123456"})
+        generated = client_a.post("/api/images/generate", json={"prompt": "neon city"})
+        assert generated.status_code == 200
+        task = wait_for_task(client_a, generated.json()["id"])
+        assert task["status"] == "succeeded"
+        tasks = client_a.get("/api/tasks").json()["items"]
 
-    client_a.put("/api/config", json={"api_key": "sk-test-123456"})
-    generated = client_a.post("/api/images/generate", json={"prompt": "neon city"})
-    assert generated.status_code == 200
+        history_a = client_a.get("/api/history").json()["items"]
+        history_b = client_b.get("/api/history").json()["items"]
+        config_b = client_b.get("/api/config").json()
+        succeeded_tasks = client_a.get("/api/tasks?status=succeeded").json()["items"]
+        queued_tasks = client_a.get("/api/tasks?status=queued").json()["items"]
 
-    history_a = client_a.get("/api/history").json()["items"]
-    history_b = client_b.get("/api/history").json()["items"]
-    config_b = client_b.get("/api/config").json()
-
-    assert len(history_a) == 1
-    assert history_a[0]["prompt"] == "neon city"
-    assert history_b == []
-    assert config_b["api_key_set"] is False
+        assert tasks[0]["id"] == generated.json()["id"]
+        assert succeeded_tasks[0]["id"] == generated.json()["id"]
+        assert queued_tasks == []
+        assert len(history_a) == 1
+        assert history_a[0]["prompt"] == "neon city"
+        assert history_b == []
+        assert config_b["api_key_set"] is False
 
 
 def test_edit_persists_upload_and_result(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    client.put("/api/config", json={"api_key": "sk-test-123456"})
+    with make_client(tmp_path) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
 
-    response = client.post(
-        "/api/images/edit",
-        data={"prompt": "make it cyberpunk"},
-        files={"image": ("source.png", b"fake-image", "image/png")},
-    )
+        response = client.post(
+            "/api/images/edit",
+            data={"prompt": "make it cyberpunk"},
+            files={"image": ("source.png", b"fake-image", "image/png")},
+        )
 
-    assert response.status_code == 200
-    item = response.json()["items"][0]
-    assert item["mode"] == "edit"
-    assert item["input_image_url"].startswith("/storage/uploads/")
-    assert Path(item["input_image_path"]).exists()
+        assert response.status_code == 200
+        task = wait_for_task(client, response.json()["id"])
+        item = task["items"][0]
+        assert item["mode"] == "edit"
+        assert item["input_image_url"].startswith("/storage/uploads/")
+        assert Path(item["input_image_path"]).exists()
 
 
 def test_account_includes_balance_and_stats(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    client.put("/api/config", json={"api_key": "sk-test-123456"})
-    client.post("/api/images/generate", json={"prompt": "one"})
+    with make_client(tmp_path) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+        generated = client.post("/api/images/generate", json={"prompt": "one"})
+        wait_for_task(client, generated.json()["id"])
 
-    response = client.get("/api/account")
+        response = client.get("/api/account")
 
-    assert response.status_code == 200
-    data = response.json()
-    assert data["balance"]["remaining"] == 12.5
-    assert data["stats"]["total"] == 1
-    assert data["viewer"]["authenticated"] is False
+        assert response.status_code == 200
+        data = response.json()
+        assert data["balance"]["remaining"] == 12.5
+        assert data["stats"]["total"] == 1
+        assert data["viewer"]["authenticated"] is False
 
 
 def test_login_binds_managed_key_and_merges_guest_history(tmp_path: Path) -> None:
     auth = FakeAuthClient()
-    client = make_client(tmp_path, auth_client=auth)
+    with make_client(tmp_path, auth_client=auth) as client:
+        client.put("/api/config", json={"api_key": "sk-guest-123456"})
+        generated = client.post("/api/images/generate", json={"prompt": "guest prompt"})
+        task_id = generated.json()["id"]
 
-    client.put("/api/config", json={"api_key": "sk-guest-123456"})
-    client.post("/api/images/generate", json={"prompt": "guest prompt"})
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+        assert login.json()["viewer"]["authenticated"] is True
+        assert auth.created_keys and auth.created_keys[0]["name"] == "cybergen-image"
+        assert auth.created_keys[0]["group"]["id"] == 42
 
-    login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
-    assert login.status_code == 200
-    assert login.json()["viewer"]["authenticated"] is True
-    assert auth.created_keys and auth.created_keys[0]["name"] == "cybergen-image"
-    assert auth.created_keys[0]["group"]["id"] == 42
+        task = wait_for_task(client, task_id)
+        assert task["status"] == "succeeded"
 
-    config = client.get("/api/config").json()
-    history = client.get("/api/history").json()["items"]
-    account = client.get("/api/account").json()
+        config = client.get("/api/config").json()
+        history = client.get("/api/history").json()["items"]
+        account = client.get("/api/account").json()
 
-    assert config["managed_by_auth"] is True
-    assert config["api_key_hint"] == "sk-use...3456"
-    assert len(history) == 1
-    assert history[0]["prompt"] == "guest prompt"
-    assert account["viewer"]["user"]["email"] == "demo@example.com"
-    assert account["user"]["api_key_source"] == "managed"
-    assert account["viewer"]["user"]["role"] == "admin"
+        assert config["managed_by_auth"] is True
+        assert config["api_key_hint"] == "sk-use...3456"
+        assert len(history) == 1
+        assert history[0]["prompt"] == "guest prompt"
+        assert account["viewer"]["user"]["email"] == "demo@example.com"
+        assert account["user"]["api_key_source"] == "managed"
+        assert account["viewer"]["user"]["role"] == "admin"
 
 
 def test_signed_in_user_can_override_key_and_clear_back_to_managed(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
+    with make_client(tmp_path) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
 
-    login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
-    assert login.status_code == 200
+        overridden = client.put("/api/config", json={"api_key": "sk-shared-bonus-654321"})
+        assert overridden.status_code == 200
+        overridden_data = overridden.json()
+        assert overridden_data["api_key_hint"] == "sk-sha...4321"
+        assert overridden_data["api_key_source"] == "manual_override"
 
-    overridden = client.put("/api/config", json={"api_key": "sk-shared-bonus-654321"})
-    assert overridden.status_code == 200
-    overridden_data = overridden.json()
-    assert overridden_data["api_key_hint"] == "sk-sha...4321"
-    assert overridden_data["api_key_source"] == "manual_override"
+        account = client.get("/api/account").json()
+        assert account["user"]["api_key_source"] == "manual_override"
 
-    account = client.get("/api/account").json()
-    assert account["user"]["api_key_source"] == "manual_override"
-
-    restored = client.put("/api/config", json={"clear_api_key": True})
-    assert restored.status_code == 200
-    restored_data = restored.json()
-    assert restored_data["api_key_hint"] == "sk-use...3456"
-    assert restored_data["api_key_source"] == "managed"
+        restored = client.put("/api/config", json={"clear_api_key": True})
+        assert restored.status_code == 200
+        restored_data = restored.json()
+        assert restored_data["api_key_hint"] == "sk-use...3456"
+        assert restored_data["api_key_source"] == "managed"
 
 
 def test_site_settings_default_to_chinese(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
+    with make_client(tmp_path) as client:
+        response = client.get("/api/site-settings")
 
-    response = client.get("/api/site-settings")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["default_locale"] == "zh-CN"
-    assert data["announcement"]["enabled"] is True
-    assert "JokoAI" in data["announcement"]["title"]
-    assert "https://ai.get-money.locker" in data["announcement"]["body"]
+        assert response.status_code == 200
+        data = response.json()
+        assert data["default_locale"] == "zh-CN"
+        assert data["announcement"]["enabled"] is True
+        assert "JokoAI" in data["announcement"]["title"]
+        assert "https://ai.get-money.locker" in data["announcement"]["body"]
 
 
 def test_admin_can_update_site_settings(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
-    assert login.status_code == 200
+    with make_client(tmp_path) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
 
-    response = client.put(
-        "/api/site-settings",
-        json={
-            "default_locale": "en-US",
-            "announcement_enabled": True,
-            "announcement_title": "系统维护通知",
-            "announcement_body": "今晚 23:00 会进行维护。",
-        },
-    )
+        response = client.put(
+            "/api/site-settings",
+            json={
+                "default_locale": "en-US",
+                "announcement_enabled": True,
+                "announcement_title": "系统维护通知",
+                "announcement_body": "今晚 23:00 会进行维护。",
+            },
+        )
 
-    assert response.status_code == 200
-    data = response.json()
-    assert data["default_locale"] == "en-US"
-    assert data["announcement"]["enabled"] is True
-    assert data["announcement"]["title"] == "系统维护通知"
+        assert response.status_code == 200
+        data = response.json()
+        assert data["default_locale"] == "en-US"
+        assert data["announcement"]["enabled"] is True
+        assert data["announcement"]["title"] == "系统维护通知"
 
 
 def test_parse_inspiration_markdown() -> None:
@@ -302,27 +326,27 @@ def test_parse_inspiration_markdown() -> None:
 
 
 def test_manual_inspiration_sync_endpoint(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    db = client.app.state.db
-    db.upsert_inspirations(
-        "https://example.com/README.md",
-        [
-            {
-                "id": "abc",
-                "source_item_id": "abc",
-                "section": "UI",
-                "title": "Mockup",
-                "author": "@demo",
-                "prompt": "make a UI",
-                "image_url": "https://example.com/image.jpg",
-                "source_link": "https://example.com/post",
-                "raw": {},
-            }
-        ],
-    )
+    with make_client(tmp_path) as client:
+        db = client.app.state.db
+        db.upsert_inspirations(
+            "https://example.com/README.md",
+            [
+                {
+                    "id": "abc",
+                    "source_item_id": "abc",
+                    "section": "UI",
+                    "title": "Mockup",
+                    "author": "@demo",
+                    "prompt": "make a UI",
+                    "image_url": "https://example.com/image.jpg",
+                    "source_link": "https://example.com/post",
+                    "raw": {},
+                }
+            ],
+        )
 
-    response = client.get("/api/inspirations")
+        response = client.get("/api/inspirations")
 
-    assert response.status_code == 200
-    item = response.json()["items"][0]
-    assert item["title"] == "Mockup"
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["title"] == "Mockup"

@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .auth_client import Sub2APIAuthClient
-from .db import Database
+from .db import Database, utc_now
 from .inspirations import run_inspiration_sync_loop, sync_inspirations
 from .provider import OpenAICompatibleImageClient, ProviderError
 from .settings import Settings
@@ -111,6 +111,7 @@ def create_app(
     settings.ensure_directories()
     db = Database(settings.database_path)
     db.init(settings)
+    db.fail_incomplete_tasks("Worker restarted before the task completed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -126,6 +127,14 @@ def create_app(
                     await task
                 except asyncio.CancelledError:
                     pass
+            pending_image_tasks = list(app.state.image_tasks.values())
+            for image_task in pending_image_tasks:
+                image_task.cancel()
+            for image_task in pending_image_tasks:
+                try:
+                    await image_task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(title="CyberGen Backend", version="2.0.0", lifespan=lifespan)
     app.state.settings = settings
@@ -133,6 +142,7 @@ def create_app(
     app.state.provider = provider or OpenAICompatibleImageClient(settings.request_timeout_seconds)
     app.state.auth_client = auth_client or Sub2APIAuthClient(settings.request_timeout_seconds)
     app.state.inspiration_task = None
+    app.state.image_tasks = {}
     app.state.last_inspiration_sync = None
     app.state.last_inspiration_sync_error = None
     app.dependency_overrides[_db] = lambda: app.state.db
@@ -479,41 +489,61 @@ def create_app(
             raise HTTPException(status_code=404, detail="History item not found")
         return {"ok": True}
 
+    @app.get("/api/tasks/{task_id}")
+    async def image_task_status(
+        task_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        task = db.get_image_task(viewer.owner_id, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return _public_image_task(db, viewer.owner_id, task)
+
+    @app.get("/api/tasks")
+    async def image_tasks(
+        limit: int = 20,
+        status: str = "",
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        allowed_statuses = {"queued", "running", "succeeded", "failed"}
+        statuses = [item.strip() for item in status.split(",") if item.strip()]
+        invalid_statuses = [item for item in statuses if item not in allowed_statuses]
+        if invalid_statuses:
+            raise HTTPException(status_code=400, detail=f"Unsupported task status filter: {', '.join(invalid_statuses)}")
+        tasks = db.list_image_tasks(viewer.owner_id, limit=limit, statuses=statuses or None)
+        return {"items": [_public_image_task(db, viewer.owner_id, task) for task in tasks]}
+
     @app.post("/api/images/generate")
     async def generate_image(
         request: GenerateRequest,
+        raw_request: Request,
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
         settings: Settings = Depends(_settings),
-        provider: OpenAICompatibleImageClient = Depends(_provider),
     ) -> dict[str, Any]:
         config = db.get_config(viewer.owner_id, settings, user_name=_viewer_name(viewer, settings))
         payload = _image_payload(config, request)
-        try:
-            response = await provider.generate_image(config, payload)
-            records = await _persist_image_response(
-                db,
-                settings,
-                owner_id=viewer.owner_id,
-                mode="generate",
-                prompt=request.prompt,
-                model=payload["model"],
-                size=payload["size"],
-                quality=payload["quality"],
-                provider_response=response,
-            )
-            return {"items": records, "provider": {"created": response.get("created"), "usage": response.get("usage")}}
-        except ProviderError as exc:
-            _record_failed_history(db, viewer.owner_id, "generate", request.prompt, payload, exc.message, exc.payload)
-            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-        except Exception as exc:
-            _record_failed_history(db, viewer.owner_id, "generate", request.prompt, payload, str(exc), None)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        task = db.create_image_task(
+            viewer.owner_id,
+            {
+                "mode": "generate",
+                "prompt": request.prompt,
+                "model": payload["model"],
+                "size": payload["size"],
+                "quality": payload["quality"],
+                "request": payload,
+            },
+        )
+        _schedule_image_task(raw_request.app, task["id"])
+        return _public_image_task(db, viewer.owner_id, task)
 
     @app.post("/api/images/edit")
     async def edit_image(
         prompt: Annotated[str, Form(min_length=1, max_length=8000)],
         image: Annotated[list[UploadFile], File()],
+        raw_request: Request,
         mask: Annotated[UploadFile | None, File()] = None,
         model: Annotated[str | None, Form()] = None,
         size: Annotated[str | None, Form()] = None,
@@ -522,7 +552,6 @@ def create_app(
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
         settings: Settings = Depends(_settings),
-        provider: OpenAICompatibleImageClient = Depends(_provider),
     ) -> dict[str, Any]:
         config = db.get_config(viewer.owner_id, settings, user_name=_viewer_name(viewer, settings))
         saved_uploads = [await save_upload(settings, upload) for upload in image]
@@ -535,36 +564,25 @@ def create_app(
             "n": str(n),
             "response_format": "b64_json",
         }
-        upload_files = [
-            (item["filename"], Path(item["path"]).read_bytes(), item["content_type"])
-            for item in saved_uploads
-        ]
-        mask_file = None
-        if saved_mask:
-            mask_file = (saved_mask["filename"], Path(saved_mask["path"]).read_bytes(), saved_mask["content_type"])
-
-        try:
-            response = await provider.edit_image(config, fields, upload_files, mask_file)
-            records = await _persist_image_response(
-                db,
-                settings,
-                owner_id=viewer.owner_id,
-                mode="edit",
-                prompt=prompt,
-                model=fields["model"],
-                size=fields["size"],
-                quality=fields["quality"],
-                provider_response=response,
-                input_image_url=saved_uploads[0]["url"] if saved_uploads else None,
-                input_image_path=saved_uploads[0]["path"] if saved_uploads else None,
-            )
-            return {"items": records, "provider": {"created": response.get("created"), "usage": response.get("usage")}}
-        except ProviderError as exc:
-            _record_failed_history(db, viewer.owner_id, "edit", prompt, fields, exc.message, exc.payload)
-            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-        except Exception as exc:
-            _record_failed_history(db, viewer.owner_id, "edit", prompt, fields, str(exc), None)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        task = db.create_image_task(
+            viewer.owner_id,
+            {
+                "mode": "edit",
+                "prompt": prompt,
+                "model": fields["model"],
+                "size": fields["size"],
+                "quality": fields["quality"],
+                "request": {
+                    "fields": fields,
+                    "uploads": saved_uploads,
+                    "mask": saved_mask,
+                },
+                "input_image_url": saved_uploads[0]["url"] if saved_uploads else None,
+                "input_image_path": saved_uploads[0]["path"] if saved_uploads else None,
+            },
+        )
+        _schedule_image_task(raw_request.app, task["id"])
+        return _public_image_task(db, viewer.owner_id, task)
 
     return app
 
@@ -822,6 +840,190 @@ def _image_payload(config: dict[str, Any], request: GenerateRequest) -> dict[str
     return payload
 
 
+def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    history_ids = task.get("result_history_ids") or []
+    return {
+        "id": task["id"],
+        "owner_id": task["owner_id"],
+        "mode": task["mode"],
+        "prompt": task["prompt"],
+        "model": task["model"],
+        "size": task["size"],
+        "quality": task["quality"],
+        "status": task["status"],
+        "error": task.get("error"),
+        "created_at": task["created_at"],
+        "updated_at": task["updated_at"],
+        "started_at": task.get("started_at"),
+        "completed_at": task.get("completed_at"),
+        "items": db.get_history_items(owner_id, history_ids),
+        "result": task.get("result"),
+    }
+
+
+def _schedule_image_task(app: FastAPI, task_id: str) -> None:
+    existing = app.state.image_tasks.get(task_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(_run_image_task(app, task_id))
+    app.state.image_tasks[task_id] = task
+
+    def _cleanup(done_task: asyncio.Task[Any]) -> None:
+        app.state.image_tasks.pop(task_id, None)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    task.add_done_callback(_cleanup)
+
+
+def _load_saved_upload(upload: dict[str, Any]) -> tuple[str, bytes, str]:
+    path = Path(str(upload["path"]))
+    return (
+        str(upload.get("filename") or path.name),
+        path.read_bytes(),
+        str(upload.get("content_type") or "application/octet-stream"),
+    )
+
+
+async def _run_image_task(app: FastAPI, task_id: str) -> None:
+    db: Database = app.state.db
+    settings: Settings = app.state.settings
+    provider: OpenAICompatibleImageClient = app.state.provider
+
+    task = db.get_image_task_by_id(task_id)
+    if task is None:
+        return
+
+    db.update_image_task(
+        task_id,
+        {
+            "status": "running",
+            "started_at": task.get("started_at") or utc_now(),
+            "error": None,
+        },
+    )
+    task = db.get_image_task_by_id(task_id)
+    if task is None:
+        return
+
+    request_payload = task.get("request") or {}
+    owner_id = task["owner_id"]
+    config = db.get_config(owner_id, settings)
+
+    try:
+        if task["mode"] == "generate":
+            if not isinstance(request_payload, dict):
+                raise ValueError("Generate task payload was missing")
+            provider_response = await provider.generate_image(config, request_payload)
+        elif task["mode"] == "edit":
+            if not isinstance(request_payload, dict):
+                raise ValueError("Edit task payload was missing")
+            fields = request_payload.get("fields")
+            uploads = request_payload.get("uploads")
+            if not isinstance(fields, dict) or not isinstance(uploads, list):
+                raise ValueError("Edit task payload was incomplete")
+            image_files = [_load_saved_upload(item) for item in uploads]
+            if not image_files:
+                raise ValueError("Edit task is missing source images")
+            saved_mask = request_payload.get("mask")
+            mask_file = _load_saved_upload(saved_mask) if isinstance(saved_mask, dict) else None
+            provider_response = await provider.edit_image(config, fields, image_files, mask_file)
+        else:
+            raise ValueError(f"Unsupported task mode: {task['mode']}")
+
+        latest_task = db.get_image_task_by_id(task_id) or task
+        items = await _persist_image_response(
+            db,
+            settings,
+            owner_id=latest_task["owner_id"],
+            mode=latest_task["mode"],
+            prompt=latest_task["prompt"],
+            model=latest_task["model"],
+            size=latest_task["size"],
+            quality=latest_task["quality"],
+            provider_response=provider_response,
+            input_image_url=latest_task.get("input_image_url"),
+            input_image_path=latest_task.get("input_image_path"),
+        )
+        db.update_image_task(
+            task_id,
+            {
+                "status": "succeeded",
+                "completed_at": utc_now(),
+                "result_history_ids": [item["id"] for item in items],
+                "result": {
+                    "created": provider_response.get("created"),
+                    "usage": provider_response.get("usage"),
+                },
+                "error": None,
+            },
+        )
+    except asyncio.CancelledError:
+        db.update_image_task(
+            task_id,
+            {
+                "status": "failed",
+                "error": "Task cancelled before completion",
+                "completed_at": utc_now(),
+            },
+        )
+        raise
+    except ProviderError as exc:
+        latest_task = db.get_image_task_by_id(task_id) or task
+        failed = _record_failed_history(
+            db,
+            owner_id=latest_task["owner_id"],
+            mode=latest_task["mode"],
+            prompt=latest_task["prompt"],
+            model=latest_task["model"],
+            size=latest_task["size"],
+            quality=latest_task["quality"],
+            message=exc.message,
+            provider_response=exc.payload,
+            input_image_url=latest_task.get("input_image_url"),
+            input_image_path=latest_task.get("input_image_path"),
+        )
+        db.update_image_task(
+            task_id,
+            {
+                "status": "failed",
+                "completed_at": utc_now(),
+                "result_history_ids": [failed["id"]] if failed else [],
+                "result": {"error": exc.message, "usage": None},
+                "error": exc.message,
+            },
+        )
+    except Exception as exc:
+        latest_task = db.get_image_task_by_id(task_id) or task
+        failed = _record_failed_history(
+            db,
+            owner_id=latest_task["owner_id"],
+            mode=latest_task["mode"],
+            prompt=latest_task["prompt"],
+            model=latest_task["model"],
+            size=latest_task["size"],
+            quality=latest_task["quality"],
+            message=str(exc),
+            provider_response=None,
+            input_image_url=latest_task.get("input_image_url"),
+            input_image_path=latest_task.get("input_image_path"),
+        )
+        db.update_image_task(
+            task_id,
+            {
+                "status": "failed",
+                "completed_at": utc_now(),
+                "result_history_ids": [failed["id"]] if failed else [],
+                "result": {"error": str(exc), "usage": None},
+                "error": str(exc),
+            },
+        )
+
+
 async def _persist_image_response(
     db: Database,
     settings: Settings,
@@ -886,19 +1088,25 @@ def _record_failed_history(
     owner_id: str,
     mode: str,
     prompt: str,
-    payload: dict[str, Any],
+    model: str,
+    size: str,
+    quality: str,
     message: str,
     provider_response: Any | None,
-) -> None:
-    db.create_history(
+    input_image_url: str | None = None,
+    input_image_path: str | None = None,
+) -> dict[str, Any]:
+    return db.create_history(
         owner_id,
         {
             "mode": mode,
             "prompt": prompt,
-            "model": payload.get("model", ""),
-            "size": payload.get("size", ""),
-            "quality": payload.get("quality", ""),
+            "model": model,
+            "size": size,
+            "quality": quality,
             "status": "failed",
+            "input_image_url": input_image_url,
+            "input_image_path": input_image_path,
             "error": message,
             "provider_response": provider_response,
         },

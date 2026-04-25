@@ -9,12 +9,16 @@ import Billing from './pages/Billing';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import AnnouncementModal from './components/AnnouncementModal';
+import TaskDrawer from './components/TaskDrawer';
+import TaskToastStack from './components/TaskToastStack';
 
 export default function App() {
   return (
     <div className="min-h-screen bg-background text-on-background font-mono overflow-x-hidden selection:bg-secondary-container selection:text-secondary">
       <TopNavBar />
       <AnnouncementModal />
+      <TaskDrawer />
+      <TaskToastStack />
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/history" element={

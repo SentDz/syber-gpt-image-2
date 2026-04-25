@@ -90,6 +90,27 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS image_tasks (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK (mode IN ('generate', 'edit')),
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+                    request_json TEXT,
+                    input_image_url TEXT,
+                    input_image_path TEXT,
+                    result_history_ids_json TEXT,
+                    result_json TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS ledger_entries (
                     id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL DEFAULT 'legacy:default',
@@ -148,6 +169,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_owner_config_managed ON owner_config(managed_by_auth);
                 CREATE INDEX IF NOT EXISTS idx_user_sessions_owner_id ON user_sessions(owner_id);
                 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at);
+                CREATE INDEX IF NOT EXISTS idx_image_tasks_owner_created_at ON image_tasks(owner_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_image_tasks_status_updated_at ON image_tasks(status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_inspiration_prompts_synced_at ON inspiration_prompts(synced_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_inspiration_prompts_section ON inspiration_prompts(section);
                 """
@@ -448,6 +471,7 @@ class Database:
                 )
 
             conn.execute("UPDATE image_history SET owner_id = ? WHERE owner_id = ?", (to_owner_id, from_owner_id))
+            conn.execute("UPDATE image_tasks SET owner_id = ? WHERE owner_id = ?", (to_owner_id, from_owner_id))
             conn.execute("UPDATE ledger_entries SET owner_id = ? WHERE owner_id = ?", (to_owner_id, from_owner_id))
             conn.execute("DELETE FROM owner_config WHERE owner_id = ?", (from_owner_id,))
 
@@ -533,6 +557,153 @@ class Database:
                 (owner_id, history_id),
             )
             return result.rowcount > 0
+
+    def create_image_task(self, owner_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        record = {
+            "id": payload.get("id") or uuid4().hex,
+            "owner_id": owner_id,
+            "mode": payload["mode"],
+            "prompt": payload["prompt"],
+            "model": payload["model"],
+            "size": payload["size"],
+            "quality": payload["quality"],
+            "status": payload.get("status", "queued"),
+            "request_json": _json_or_none(payload.get("request")),
+            "input_image_url": payload.get("input_image_url"),
+            "input_image_path": payload.get("input_image_path"),
+            "result_history_ids_json": _json_or_none(payload.get("result_history_ids") or []),
+            "result_json": _json_or_none(payload.get("result")),
+            "error": payload.get("error"),
+            "created_at": now,
+            "updated_at": now,
+            "started_at": payload.get("started_at"),
+            "completed_at": payload.get("completed_at"),
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO image_tasks (
+                    id, owner_id, mode, prompt, model, size, quality, status, request_json,
+                    input_image_url, input_image_path, result_history_ids_json, result_json, error,
+                    created_at, updated_at, started_at, completed_at
+                )
+                VALUES (
+                    :id, :owner_id, :mode, :prompt, :model, :size, :quality, :status, :request_json,
+                    :input_image_url, :input_image_path, :result_history_ids_json, :result_json, :error,
+                    :created_at, :updated_at, :started_at, :completed_at
+                )
+                """,
+                record,
+            )
+        return self.get_image_task(owner_id, record["id"])
+
+    def get_image_task(self, owner_id: str, task_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM image_tasks WHERE owner_id = ? AND id = ?",
+                (owner_id, task_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return _image_task_row(row)
+
+    def list_image_tasks(
+        self,
+        owner_id: str,
+        limit: int = 20,
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 100))
+        clauses = ["owner_id = ?"]
+        params: list[Any] = [owner_id]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        where = " AND ".join(clauses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM image_tasks
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [_image_task_row(row) for row in rows]
+
+    def update_image_task(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        updates: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in {"status", "input_image_url", "input_image_path", "error", "started_at", "completed_at"}:
+                updates[key] = value
+            elif key == "request":
+                updates["request_json"] = _json_or_none(value)
+            elif key == "request_json":
+                updates["request_json"] = value
+            elif key == "result_history_ids":
+                updates["result_history_ids_json"] = _json_or_none(value or [])
+            elif key == "result_history_ids_json":
+                updates["result_history_ids_json"] = value
+            elif key == "result":
+                updates["result_json"] = _json_or_none(value)
+            elif key == "result_json":
+                updates["result_json"] = value
+        if not updates:
+            return self.get_image_task_by_id(task_id)
+        with self.connect() as conn:
+            row = conn.execute("SELECT owner_id FROM image_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return None
+            updates["updated_at"] = utc_now()
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            values = list(updates.values())
+            values.append(task_id)
+            conn.execute(f"UPDATE image_tasks SET {assignments} WHERE id = ?", values)
+        return self.get_image_task(str(row["owner_id"]), task_id)
+
+    def get_image_task_by_id(self, task_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM image_tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        return _image_task_row(row)
+
+    def get_history_items(self, owner_id: str, history_ids: list[str]) -> list[dict[str, Any]]:
+        if not history_ids:
+            return []
+        placeholders = ", ".join("?" for _ in history_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM image_history
+                WHERE owner_id = ? AND id IN ({placeholders})
+                """,
+                (owner_id, *history_ids),
+            ).fetchall()
+        items: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            record = _history_row(row)
+            items[record["id"]] = record
+        return [items[item_id] for item_id in history_ids if item_id in items]
+
+    def fail_incomplete_tasks(self, message: str) -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE image_tasks
+                SET status = 'failed',
+                    error = ?,
+                    completed_at = COALESCE(completed_at, ?),
+                    updated_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (message, now, now),
+            )
+            return int(result.rowcount or 0)
 
     def add_ledger_entry(self, owner_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         record = {
@@ -813,6 +984,14 @@ def _history_row(row: sqlite3.Row) -> dict[str, Any]:
 def _ledger_row(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["metadata"] = _json_load(data.pop("metadata_json"))
+    return data
+
+
+def _image_task_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["request"] = _json_load(data.pop("request_json"))
+    data["result_history_ids"] = _json_load(data.pop("result_history_ids_json")) or []
+    data["result"] = _json_load(data.pop("result_json"))
     return data
 
 

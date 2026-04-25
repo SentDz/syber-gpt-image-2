@@ -4,6 +4,15 @@ import { deleteHistory, formatDate, generateImage, getHistory, HistoryItem } fro
 import { useAuth } from '../auth';
 import ImagePreviewModal from '../components/ImagePreviewModal';
 import { useSite } from '../site';
+import { useTasks } from '../tasks';
+
+function mergeHistory(items: HistoryItem[]) {
+  const merged = new Map<string, HistoryItem>();
+  for (const item of items) {
+    merged.set(item.id, item);
+  }
+  return [...merged.values()].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
 
 const getColorClasses = (colorMode: string) => {
   if (colorMode === 'primary') {
@@ -29,7 +38,9 @@ const getColorClasses = (colorMode: string) => {
 export default function History() {
   const { viewer } = useAuth();
   const { t } = useSite();
+  const { addTask, openDrawer, taskHistoryItems } = useTasks();
   const [items, setItems] = useState<HistoryItem[]>([]);
+  const [removedIds, setRemovedIds] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [offset, setOffset] = useState(0);
   const [previewItem, setPreviewItem] = useState<HistoryItem | null>(null);
@@ -42,6 +53,9 @@ export default function History() {
     try {
       const data = await getHistory({ limit: 24, offset: nextOffset, q: query });
       setItems((current) => (append ? [...current, ...data.items] : data.items));
+      if (!append) {
+        setRemovedIds([]);
+      }
       setOffset(nextOffset + data.items.length);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -57,20 +71,24 @@ export default function History() {
   async function handleDelete(id: string) {
     await deleteHistory(id);
     setItems((current) => current.filter((item) => item.id !== id));
+    setRemovedIds((current) => (current.includes(id) ? current : [...current, id]));
   }
 
   async function handleRegenerate(item: HistoryItem) {
     setLoading(true);
     setError('');
     try {
-      const response = await generateImage({ prompt: item.prompt, size: item.size, quality: item.quality });
-      setItems((current) => [...response.items, ...current]);
+      const submittedTask = await generateImage({ prompt: item.prompt, size: item.size, quality: item.quality });
+      addTask(submittedTask);
+      openDrawer();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
   }
+
+  const visibleItems = mergeHistory([...taskHistoryItems, ...items]).filter((item) => !removedIds.includes(item.id));
 
   return (
     <div className="md:ml-64 px-6 md:px-12 py-8 max-w-[1440px] mx-auto min-h-screen pt-24 pb-12 bg-[radial-gradient(ellipse_at_top,var(--color-surface-container-high),var(--color-background))] font-mono">
@@ -106,7 +124,7 @@ export default function History() {
       {error && <div className="mb-6 border border-error/40 bg-error/10 p-4 text-error text-xs">{error}</div>}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-        {items.map((item, index) => {
+        {visibleItems.map((item, index) => {
           const colors = getColorClasses(index % 2 === 0 ? 'primary' : 'secondary');
           return (
           <div

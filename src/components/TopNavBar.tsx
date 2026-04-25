@@ -1,9 +1,10 @@
 import { Link, useLocation } from 'react-router-dom';
 import { useEffect, useState } from 'react';
-import { Bell, LogOut } from 'lucide-react';
+import { Bell, ListTodo, LogOut } from 'lucide-react';
 import { AccountInfo, formatBalance, getAccount, logoutAccount } from '../api';
 import { useAuth } from '../auth';
 import { useSite } from '../site';
+import { useTasks } from '../tasks';
 import AvatarBadge from './AvatarBadge';
 import jokoLogo from '../../joko.svg';
 
@@ -11,6 +12,7 @@ export default function TopNavBar() {
   const location = useLocation();
   const { viewer, refresh } = useAuth();
   const { siteSettings, openAnnouncement, t } = useSite();
+  const { activeCount, openDrawer } = useTasks();
   const [account, setAccount] = useState<AccountInfo | null>(null);
 
   useEffect(() => {
@@ -82,6 +84,20 @@ export default function TopNavBar() {
             </Link>
           </div>
         </div>
+
+        <button
+          className="relative flex h-10 w-10 items-center justify-center border border-primary/20 text-primary transition-colors hover:bg-primary/10"
+          type="button"
+          onClick={openDrawer}
+          title={t('top_tasks')}
+        >
+          <ListTodo size={16} />
+          {activeCount > 0 ? (
+            <span className="absolute -right-1 -top-1 min-w-[18px] rounded-full bg-secondary px-1.5 py-0.5 text-[9px] font-bold text-white">
+              {activeCount}
+            </span>
+          ) : null}
+        </button>
 
         <button
           className="relative flex h-10 w-10 items-center justify-center border border-primary/20 text-primary transition-colors hover:bg-primary/10"
