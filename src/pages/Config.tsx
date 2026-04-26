@@ -339,15 +339,22 @@ export default function Config() {
                 <input className="input-cyber" value={config?.model || 'gpt-image-2'} onChange={(event) => setConfig((current) => current && { ...current, model: event.target.value })} />
               </Field>
               <Field label={t('config_size')}>
-                <select className="input-cyber" value={config?.default_size || '1024x1024'} onChange={(event) => setConfig((current) => current && { ...current, default_size: event.target.value })}>
-                  <option>1024x1024</option>
-                  <option>1024x1536</option>
-                  <option>1536x1024</option>
-                  <option>auto</option>
-                </select>
+                <>
+                  <input
+                    className="input-cyber"
+                    list="image-size-options"
+                    value={config?.default_size || '2K'}
+                    onChange={(event) => setConfig((current) => current && { ...current, default_size: event.target.value })}
+                  />
+                  <datalist id="image-size-options">
+                    <option value="1K" />
+                    <option value="2K" />
+                    <option value="4K" />
+                  </datalist>
+                </>
               </Field>
               <Field label={t('config_quality')}>
-                <select className="input-cyber" value={config?.default_quality || 'medium'} onChange={(event) => setConfig((current) => current && { ...current, default_quality: event.target.value })}>
+                <select className="input-cyber" value={config?.default_quality || 'auto'} onChange={(event) => setConfig((current) => current && { ...current, default_quality: event.target.value })}>
                   <option>low</option>
                   <option>medium</option>
                   <option>high</option>

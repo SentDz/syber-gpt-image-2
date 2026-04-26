@@ -141,6 +141,7 @@ export default function TaskDrawer() {
                           <div className="mt-2 flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.18em] text-white/45">
                             <span>{task.model}</span>
                             <span>{task.size}</span>
+                            {task.aspect_ratio ? <span>{task.aspect_ratio}</span> : null}
                             <span>{task.quality}</span>
                           </div>
                           {task.error ? <div className="mt-2 text-xs text-error">{task.error}</div> : null}

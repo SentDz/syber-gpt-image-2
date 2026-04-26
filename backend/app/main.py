@@ -35,10 +35,41 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=8000)
     model: str | None = None
     size: str | None = None
+    aspect_ratio: str | None = None
     quality: str | None = None
     n: int = Field(default=1, ge=1, le=4)
     background: str | None = None
     output_format: str | None = None
+
+
+SIZE_PRESETS: dict[str, dict[str, str]] = {
+    "1K": {
+        "1:1": "1024x1024",
+        "16:9": "1024x576",
+        "9:16": "576x1024",
+        "3:2": "1024x683",
+        "2:3": "683x1024",
+        "4:3": "1024x768",
+        "3:4": "768x1024",
+    },
+    "2K": {
+        "1:1": "2048x2048",
+        "16:9": "2048x1152",
+        "9:16": "1152x2048",
+        "3:2": "2048x1365",
+        "2:3": "1365x2048",
+        "4:3": "2048x1536",
+        "3:4": "1536x2048",
+    },
+    "4K": {
+        "16:9": "3840x2160",
+        "9:16": "2160x3840",
+        "3:2": "3840x2560",
+        "2:3": "2560x3840",
+        "4:3": "3840x2880",
+        "3:4": "2880x3840",
+    },
+}
 
 
 class AuthSendVerifyCodeRequest(BaseModel):
@@ -98,9 +129,6 @@ class ViewerContext:
     def is_admin(self) -> bool:
         user = self.user
         return bool(user and user.get("role") == "admin")
-
-
-PREFERRED_IMAGE_GROUP_NAME = "gpt-image-2"
 
 
 def create_app(
@@ -193,7 +221,6 @@ def create_app(
             "sub2api_auth_base_url": settings.auth_base_url,
             "detected": {
                 "sub2api": "http://127.0.0.1:9878",
-                "cli_proxy_api": "http://127.0.0.1:8389",
             },
             "inspirations": db.inspiration_stats(),
             "last_inspiration_sync_error": app.state.last_inspiration_sync_error,
@@ -574,6 +601,7 @@ def create_app(
                 "prompt": request.prompt,
                 "model": payload["model"],
                 "size": payload["size"],
+                "aspect_ratio": request.aspect_ratio or "",
                 "quality": payload["quality"],
                 "request": payload,
             },
@@ -589,6 +617,7 @@ def create_app(
         mask: Annotated[UploadFile | None, File()] = None,
         model: Annotated[str | None, Form()] = None,
         size: Annotated[str | None, Form()] = None,
+        aspect_ratio: Annotated[str | None, Form()] = None,
         quality: Annotated[str | None, Form()] = None,
         n: Annotated[int, Form(ge=1, le=4)] = 1,
         viewer: ViewerContext = Depends(_viewer),
@@ -601,7 +630,7 @@ def create_app(
         fields = {
             "model": model or config["model"],
             "prompt": prompt,
-            "size": size or config["default_size"],
+            "size": _provider_image_size(size or config["default_size"], aspect_ratio),
             "quality": quality or config["default_quality"],
             "n": str(n),
             "response_format": "b64_json",
@@ -613,6 +642,7 @@ def create_app(
                 "prompt": prompt,
                 "model": fields["model"],
                 "size": fields["size"],
+                "aspect_ratio": aspect_ratio or "",
                 "quality": fields["quality"],
                 "request": {
                     "fields": fields,
@@ -810,11 +840,7 @@ async def _resolve_user_api_key(
     if selected and selected.get("key"):
         return str(selected["key"])
 
-    groups = await auth_client.list_available_groups(settings.auth_base_url, access_token)
-    selected_group = _select_openai_group(groups)
     payload: dict[str, Any] = {"name": "cybergen-image"}
-    if selected_group is not None:
-        payload["group_id"] = selected_group
     created = await auth_client.create_key(settings.auth_base_url, access_token, payload)
     key = str(created.get("key") or "").strip()
     if not key:
@@ -823,39 +849,16 @@ async def _resolve_user_api_key(
 
 
 def _select_existing_key(keys: list[dict[str, Any]]) -> dict[str, Any] | None:
-    def sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
+    def sort_key(item: dict[str, Any]) -> tuple[int, int]:
         status = 0 if item.get("status") == "active" else 1
         group = item.get("group") if isinstance(item.get("group"), dict) else {}
         platform = 0 if group.get("platform") == "openai" else 1
-        preferred = 0 if _normalize_group_name(group.get("name")) == PREFERRED_IMAGE_GROUP_NAME else 1
-        return status, preferred, platform
+        return status, platform
 
     candidates = [item for item in keys if isinstance(item.get("key"), str) and item.get("key")]
     if not candidates:
         return None
     return sorted(candidates, key=sort_key)[0]
-
-
-def _select_openai_group(groups: list[dict[str, Any]]) -> int | None:
-    ranked: list[tuple[int, int, int, int]] = []
-    for item in groups:
-        group_id = item.get("id")
-        if not isinstance(group_id, int):
-            continue
-        status_rank = 0 if item.get("status") == "active" else 1
-        preferred_rank = 0 if _normalize_group_name(item.get("name")) == PREFERRED_IMAGE_GROUP_NAME else 1
-        platform_rank = 0 if item.get("platform") == "openai" else 1
-        ranked.append((status_rank, preferred_rank, platform_rank, group_id))
-    if not ranked:
-        return None
-    ranked.sort()
-    return ranked[0][3]
-
-
-def _normalize_group_name(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return "-".join(value.strip().lower().replace("_", "-").split())
 
 
 def _client_ip(request: Request) -> str | None:
@@ -871,7 +874,7 @@ def _image_payload(config: dict[str, Any], request: GenerateRequest) -> dict[str
     payload = {
         "model": request.model or config["model"],
         "prompt": request.prompt,
-        "size": request.size or config["default_size"],
+        "size": _provider_image_size(request.size or config["default_size"], request.aspect_ratio),
         "quality": request.quality or config["default_quality"],
         "n": request.n,
         "response_format": "b64_json",
@@ -883,6 +886,24 @@ def _image_payload(config: dict[str, Any], request: GenerateRequest) -> dict[str
     return payload
 
 
+def _provider_image_size(size: str, aspect_ratio: str | None = None) -> str:
+    cleaned_size = str(size or "").strip()
+    scale = cleaned_size.upper()
+    ratio = str(aspect_ratio or "1:1").strip() or "1:1"
+    if scale in SIZE_PRESETS:
+        if ratio not in SIZE_PRESETS[scale]:
+            raise HTTPException(status_code=400, detail=f"Unsupported image size combination: {scale} {ratio}")
+        return SIZE_PRESETS[scale][ratio]
+    dimension_parts = cleaned_size.lower().split("x")
+    if len(dimension_parts) == 2 and all(part.isdigit() for part in dimension_parts):
+        width, height = (int(part) for part in dimension_parts)
+        if max(width, height) > 3840:
+            raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
+        if width == height and width > 2048:
+            raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
+    return cleaned_size
+
+
 def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dict[str, Any]:
     history_ids = task.get("result_history_ids") or []
     return {
@@ -892,6 +913,7 @@ def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dic
         "prompt": task["prompt"],
         "model": task["model"],
         "size": task["size"],
+        "aspect_ratio": task.get("aspect_ratio") or "",
         "quality": task["quality"],
         "status": task["status"],
         "error": task.get("error"),
@@ -987,6 +1009,7 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
             prompt=latest_task["prompt"],
             model=latest_task["model"],
             size=latest_task["size"],
+            aspect_ratio=latest_task.get("aspect_ratio") or "",
             quality=latest_task["quality"],
             provider_response=provider_response,
             input_image_url=latest_task.get("input_image_url"),
@@ -1024,6 +1047,7 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
             prompt=latest_task["prompt"],
             model=latest_task["model"],
             size=latest_task["size"],
+            aspect_ratio=latest_task.get("aspect_ratio") or "",
             quality=latest_task["quality"],
             message=exc.message,
             provider_response=exc.payload,
@@ -1049,6 +1073,7 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
             prompt=latest_task["prompt"],
             model=latest_task["model"],
             size=latest_task["size"],
+            aspect_ratio=latest_task.get("aspect_ratio") or "",
             quality=latest_task["quality"],
             message=str(exc),
             provider_response=None,
@@ -1076,6 +1101,7 @@ async def _persist_image_response(
     prompt: str,
     model: str,
     size: str,
+    aspect_ratio: str,
     quality: str,
     provider_response: dict[str, Any],
     input_image_url: str | None = None,
@@ -1099,6 +1125,7 @@ async def _persist_image_response(
                 "prompt": prompt,
                 "model": model,
                 "size": size,
+                "aspect_ratio": aspect_ratio,
                 "quality": quality,
                 "status": "succeeded",
                 "image_url": saved["url"],
@@ -1117,7 +1144,7 @@ async def _persist_image_response(
                 "amount": 0,
                 "description": f"{mode.upper()} {model}",
                 "history_id": record["id"],
-                "metadata": {"size": size, "quality": quality},
+                "metadata": {"size": size, "aspect_ratio": aspect_ratio, "quality": quality},
             },
         )
         records.append(record)
@@ -1133,6 +1160,7 @@ def _record_failed_history(
     prompt: str,
     model: str,
     size: str,
+    aspect_ratio: str,
     quality: str,
     message: str,
     provider_response: Any | None,
@@ -1146,6 +1174,7 @@ def _record_failed_history(
             "prompt": prompt,
             "model": model,
             "size": size,
+            "aspect_ratio": aspect_ratio,
             "quality": quality,
             "status": "failed",
             "input_image_url": input_image_url,

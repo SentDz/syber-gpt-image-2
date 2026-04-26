@@ -80,7 +80,12 @@ export default function History() {
     setLoading(true);
     setError('');
     try {
-      const submittedTask = await generateImage({ prompt: item.prompt, size: item.size, quality: item.quality });
+      const submittedTask = await generateImage({
+        prompt: item.prompt,
+        size: item.size,
+        aspect_ratio: item.aspect_ratio,
+        quality: item.quality,
+      });
       addTask(submittedTask);
       openDrawer();
     } catch (err) {
@@ -183,6 +188,7 @@ export default function History() {
                 <span className={colors.textId}>ID:{item.id.slice(0, 4).toUpperCase()}</span>
                 <span>{formatDate(item.created_at)}</span>
                 <span>{item.size}</span>
+                {item.aspect_ratio ? <span>{item.aspect_ratio}</span> : null}
                 {item.published ? <span className="text-tertiary">{t('history_published')}</span> : null}
               </div>
               <p className={`mb-3 line-clamp-3 text-sm ${colors.textId} transition-colors`}>

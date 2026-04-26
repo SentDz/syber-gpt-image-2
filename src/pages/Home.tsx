@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ImagePlus, Grid, List, Maximize2, RefreshCw, Loader2, X } from 'lucide-react';
-import { editImage, generateImage, getHistory, getInspirations, getInspirationStats, HistoryItem, InspirationItem } from '../api';
+import { editImage, generateImage, getConfig, getHistory, getInspirations, getInspirationStats, HistoryItem, InspirationItem } from '../api';
 import { useAuth } from '../auth';
 import ImagePreviewModal from '../components/ImagePreviewModal';
 import MasonryGrid from '../components/MasonryGrid';
@@ -8,6 +8,37 @@ import { useSite } from '../site';
 import { useTasks } from '../tasks';
 
 const FEED_PAGE_SIZE = 24;
+const SIZE_OPTIONS = ['1K', '2K', '4K'];
+const ASPECT_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
+const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
+const SIZE_PRESETS: Record<string, Record<string, string>> = {
+  '1K': {
+    '1:1': '1024x1024',
+    '16:9': '1024x576',
+    '9:16': '576x1024',
+    '3:2': '1024x683',
+    '2:3': '683x1024',
+    '4:3': '1024x768',
+    '3:4': '768x1024',
+  },
+  '2K': {
+    '1:1': '2048x2048',
+    '16:9': '2048x1152',
+    '9:16': '1152x2048',
+    '3:2': '2048x1365',
+    '2:3': '1365x2048',
+    '4:3': '2048x1536',
+    '3:4': '1536x2048',
+  },
+  '4K': {
+    '16:9': '3840x2160',
+    '9:16': '2160x3840',
+    '3:2': '3840x2560',
+    '2:3': '2560x3840',
+    '4:3': '3840x2880',
+    '3:4': '2880x3840',
+  },
+};
 
 function mergeHistory(items: HistoryItem[]) {
   const merged = new Map<string, HistoryItem>();
@@ -25,6 +56,9 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [inspirations, setInspirations] = useState<InspirationItem[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [imageScale, setImageScale] = useState('2K');
+  const [aspectRatio, setAspectRatio] = useState('1:1');
+  const [imageQuality, setImageQuality] = useState('auto');
   const [previewItem, setPreviewItem] = useState<{ imageUrl: string; prompt: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [feedLoading, setFeedLoading] = useState(true);
@@ -36,6 +70,26 @@ export default function Home() {
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setImageScale(normalizeImageScale(config.default_size));
+        setImageQuality(config.default_quality || 'auto');
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [viewer?.owner_id]);
+
+  useEffect(() => {
+    if (!isSupportedImagePreset(imageScale, aspectRatio)) {
+      setImageScale('2K');
+    }
+  }, [aspectRatio, imageScale]);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,10 +175,15 @@ export default function Home() {
     setLoading(true);
     setError('');
     setMessage(selectedFile ? t('home_message_edit_sent') : t('home_message_generate_sent'));
+    const imageOptions = {
+      size: providerImageSize(imageScale, aspectRatio),
+      aspect_ratio: aspectRatio,
+      quality: imageQuality,
+    };
     try {
       const submittedTask = selectedFile
-        ? await editImage({ prompt }, selectedFile)
-        : await generateImage({ prompt });
+        ? await editImage({ prompt, ...imageOptions }, selectedFile)
+        : await generateImage({ prompt, ...imageOptions });
       addTask(submittedTask);
       openDrawer();
       setMessage(submittedTask.status === 'running' ? t('home_message_processing') : t('home_message_queued'));
@@ -155,6 +214,12 @@ export default function Home() {
     title: item.title,
   }));
   const visibleFeed = [...generatedFeed, ...inspirationFeed].filter((item) => item.img);
+  const handleAspectRatioChange = (nextRatio: string) => {
+    setAspectRatio(nextRatio);
+    if (nextRatio === '1:1' && imageScale === '4K') {
+      setImageScale('2K');
+    }
+  };
 
   return (
     <div className="pt-24 pb-48 px-6 max-w-[1440px] mx-auto min-h-screen bg-[radial-gradient(ellipse_at_top,var(--color-surface-container-high),var(--color-background))] font-mono">
@@ -280,13 +345,30 @@ export default function Home() {
       )}
 
       <div className="fixed bottom-6 left-6 right-6 md:left-auto md:right-auto md:w-[calc(100%-3rem)] max-w-[960px] mx-auto bg-surface-container/90 backdrop-blur-xl border border-primary/40 p-5 rounded-sm shadow-[0_-20px_40px_rgba(0,0,0,0.8)] z-50 font-mono">
-        <div className="flex items-center gap-4 mb-4">
-          <div className="flex items-center gap-2 text-[10px] text-white/50 border-r border-white/10 pr-4">
+          <div className="flex items-center gap-4 mb-4">
+            <div className="flex items-center gap-2 text-[10px] text-white/50 border-r border-white/10 pr-4">
              <span className="w-2 h-2 bg-secondary rounded-full animate-pulse"></span> {t('home_mode')}: {selectedFile ? t('home_mode_edit') : t('home_mode_generate')}
+          </div>
+          <div className="hidden items-center gap-2 text-[10px] uppercase tracking-widest text-white/45 md:flex">
+            <span>{imageScale}</span>
+            <span>{aspectRatio}</span>
+            <span>{imageQuality}</span>
           </div>
           <div className="text-[10px] text-primary uppercase tracking-widest truncate">
             {message || (promptValue ? t('home_message_loaded') : t('home_message_waiting'))}
           </div>
+        </div>
+
+        <div className="mb-4 grid grid-cols-3 gap-2">
+          <GenerationSelect
+            label={t('home_size')}
+            value={imageScale}
+            onChange={setImageScale}
+            options={SIZE_OPTIONS}
+            isOptionDisabled={(option) => !isSupportedImagePreset(option, aspectRatio)}
+          />
+          <GenerationSelect label={t('home_aspect_ratio')} value={aspectRatio} onChange={handleAspectRatioChange} options={ASPECT_RATIO_OPTIONS} />
+          <GenerationSelect label={t('home_quality')} value={imageQuality} onChange={setImageQuality} options={QUALITY_OPTIONS} />
         </div>
 
         <div className="flex flex-col sm:flex-row gap-4">
@@ -347,4 +429,60 @@ export default function Home() {
       />
     </div>
   );
+}
+
+function GenerationSelect({
+  label,
+  value,
+  options,
+  onChange,
+  isOptionDisabled,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  isOptionDisabled?: (value: string) => boolean;
+}) {
+  return (
+    <label className="min-w-0">
+      <span className="mb-1 block truncate text-[9px] uppercase tracking-[0.2em] text-white/40">{label}</span>
+      <select
+        className="h-10 w-full border border-primary/20 bg-black px-2 text-xs uppercase text-primary outline-none transition-colors focus:border-primary"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option} disabled={isOptionDisabled?.(option) || false}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function normalizeImageScale(value: string | undefined) {
+  const normalized = (value || '').trim().toUpperCase();
+  if (SIZE_OPTIONS.includes(normalized)) {
+    return normalized;
+  }
+  if (/^1\d{3}x1\d{3}$/i.test(normalized)) {
+    return '1K';
+  }
+  if (/^2\d{3}x|x2\d{3}$/i.test(normalized)) {
+    return '2K';
+  }
+  if (/^[34]\d{3}x|x[34]\d{3}$/i.test(normalized)) {
+    return '4K';
+  }
+  return '2K';
+}
+
+function providerImageSize(scale: string, ratio: string) {
+  return SIZE_PRESETS[scale]?.[ratio] || SIZE_PRESETS['2K']['1:1'];
+}
+
+function isSupportedImagePreset(scale: string, ratio: string) {
+  return Boolean(SIZE_PRESETS[scale]?.[ratio]);
 }

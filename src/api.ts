@@ -34,6 +34,7 @@ export type HistoryItem = {
   prompt: string;
   model: string;
   size: string;
+  aspect_ratio: string;
   quality: string;
   status: 'succeeded' | 'failed';
   image_url: string | null;
@@ -58,6 +59,7 @@ export type ImageTask = {
   prompt: string;
   model: string;
   size: string;
+  aspect_ratio: string;
   quality: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed';
   error: string | null;
@@ -141,6 +143,7 @@ export type GeneratePayload = {
   prompt: string;
   model?: string;
   size?: string;
+  aspect_ratio?: string;
   quality?: string;
   n?: number;
 };
@@ -357,6 +360,7 @@ export function editImage(payload: GeneratePayload, image: File) {
   form.set('prompt', payload.prompt);
   if (payload.model) form.set('model', payload.model);
   if (payload.size) form.set('size', payload.size);
+  if (payload.aspect_ratio) form.set('aspect_ratio', payload.aspect_ratio);
   if (payload.quality) form.set('quality', payload.quality);
   form.set('n', String(payload.n || 1));
   form.set('image', image);

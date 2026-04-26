@@ -5,9 +5,8 @@ React frontend plus a FastAPI backend for Sub2API/OpenAI-compatible image genera
 Local services detected on this machine:
 
 - Sub2API: `http://127.0.0.1:9878`, OpenAI-compatible base URL `http://127.0.0.1:9878/v1`
-- cli-proxy-api: `http://127.0.0.1:8389`
 
-The app calls `/v1/images/generations` for generation, `/v1/images/edits` for edits, and reads balance/usage from `/v1/usage`.
+The app calls `/v1/images/generations` for generation, `/v1/images/edits` for edits, and reads balance/usage from `/v1/usage`. Per generation, the frontend lets users choose a scale such as `2K` and an aspect ratio such as `16:9`, then sends the concrete provider `size` as `WIDTHxHEIGHT` such as `2048x1152`. Scale buckets are based on the longest edge: `1K` stays at or below 1024px, `2K` at or below 2048px, and `4K` at or below 3840px. `4K + 1:1` is disabled because `3840x3840` exceeds the upstream pixel budget; direct square sizes above `2048x2048` are rejected by the backend. Use `2K + 1:1` for square images.
 
 Identity modes:
 

@@ -6,10 +6,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.inspirations import cache_inspiration_images, normalize_inspiration_source_url, parse_inspiration_markdown
-from app.main import create_app, _auth_client, _db, _provider, _settings
+from app.main import create_app, _auth_client, _db, _provider, _provider_image_size, _settings
 from app.settings import Settings
 
 
@@ -19,6 +21,10 @@ PNG_B64 = (
 
 
 class FakeProvider:
+    def __init__(self) -> None:
+        self.generated_payloads: list[dict[str, Any]] = []
+        self.edited_fields: list[dict[str, Any]] = []
+
     async def test_connection(self, config: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "models": ["gpt-image-2"], "raw": {"data": [{"id": "gpt-image-2"}]}}
 
@@ -28,6 +34,7 @@ class FakeProvider:
     async def generate_image(self, config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0.02)
         assert payload["model"] == "gpt-image-2"
+        self.generated_payloads.append(payload)
         return {"created": 123, "data": [{"b64_json": PNG_B64, "revised_prompt": "revised"}], "usage": {"total_tokens": 1}}
 
     async def edit_image(
@@ -39,6 +46,7 @@ class FakeProvider:
     ) -> dict[str, Any]:
         await asyncio.sleep(0.02)
         assert images
+        self.edited_fields.append(fields)
         return {"created": 124, "data": [{"b64_json": PNG_B64}], "usage": {"total_tokens": 2}}
 
 
@@ -80,17 +88,14 @@ class FakeAuthClient:
         return []
 
     async def list_available_groups(self, base_url: str, access_token: str) -> list[dict[str, Any]]:
-        return [
-            {"id": 41, "name": "general-openai", "platform": "openai", "status": "active"},
-            {"id": 42, "name": "gpt-image-2", "platform": "openai", "status": "active"},
-        ]
+        raise AssertionError("Direct Sub2API mode should not require a dedicated image group")
 
     async def create_key(self, base_url: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
         key = {
             "id": 99,
             "key": "sk-user-managed-123456",
             "name": payload["name"],
-            "group": {"id": payload.get("group_id"), "name": "gpt-image-2", "platform": "openai"},
+            "group": {"id": payload.get("group_id"), "name": "general-openai", "platform": "openai"},
             "status": "active",
         }
         self.created_keys.append(key)
@@ -106,8 +111,8 @@ def make_app(tmp_path: Path, auth_client: FakeAuthClient | None = None):
         auth_base_url="http://127.0.0.1:9878",
         provider_usage_path="/v1/usage",
         image_model="gpt-image-2",
-        default_size="1024x1024",
-        default_quality="medium",
+        default_size="2K",
+        default_quality="auto",
         user_name="tester",
         cors_origins=["http://127.0.0.1:3000"],
         request_timeout_seconds=10,
@@ -177,6 +182,40 @@ def test_guest_history_is_isolated_by_cookie(tmp_path: Path) -> None:
         assert history_a[0]["prompt"] == "neon city"
         assert history_b == []
         assert config_b["api_key_set"] is False
+
+
+def test_generation_passes_resolution_ratio_and_quality(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    with TestClient(app) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+
+        generated = client.post(
+            "/api/images/generate",
+            json={"prompt": "wide city", "size": "2K", "aspect_ratio": "16:9", "quality": "high"},
+        )
+
+        assert generated.status_code == 200
+        task = wait_for_task(client, generated.json()["id"])
+        item = task["items"][0]
+        provider = client.app.state.provider
+        assert task["size"] == "2048x1152"
+        assert task["aspect_ratio"] == "16:9"
+        assert item["aspect_ratio"] == "16:9"
+        assert provider.generated_payloads[-1]["size"] == "2048x1152"
+        assert "aspectRatio" not in provider.generated_payloads[-1]
+        assert provider.generated_payloads[-1]["quality"] == "high"
+
+
+def test_image_size_presets_follow_provider_limits() -> None:
+    assert _provider_image_size("1K", "16:9") == "1024x576"
+    assert _provider_image_size("2K", "16:9") == "2048x1152"
+    assert _provider_image_size("4K", "16:9") == "3840x2160"
+    with pytest.raises(HTTPException):
+        _provider_image_size("4K", "1:1")
+    with pytest.raises(HTTPException):
+        _provider_image_size("3840x3840", "1:1")
+    with pytest.raises(HTTPException):
+        _provider_image_size("4096x4096", "1:1")
 
 
 def test_edit_persists_upload_and_result(tmp_path: Path) -> None:
@@ -251,7 +290,7 @@ def test_login_binds_managed_key_and_merges_guest_history(tmp_path: Path) -> Non
         assert login.status_code == 200
         assert login.json()["viewer"]["authenticated"] is True
         assert auth.created_keys and auth.created_keys[0]["name"] == "cybergen-image"
-        assert auth.created_keys[0]["group"]["id"] == 42
+        assert auth.created_keys[0]["group"]["id"] is None
 
         task = wait_for_task(client, task_id)
         assert task["status"] == "succeeded"

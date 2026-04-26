@@ -86,6 +86,7 @@ class Database:
                     prompt TEXT NOT NULL,
                     model TEXT NOT NULL,
                     size TEXT NOT NULL,
+                    aspect_ratio TEXT NOT NULL DEFAULT '',
                     quality TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
                     image_url TEXT,
@@ -107,6 +108,7 @@ class Database:
                     prompt TEXT NOT NULL,
                     model TEXT NOT NULL,
                     size TEXT NOT NULL,
+                    aspect_ratio TEXT NOT NULL DEFAULT '',
                     quality TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
                     request_json TEXT,
@@ -208,6 +210,12 @@ class Database:
             conn.execute(
                 f"ALTER TABLE image_history ADD COLUMN owner_id TEXT NOT NULL DEFAULT '{LEGACY_OWNER_ID}'"
             )
+        if image_columns and "aspect_ratio" not in image_columns:
+            conn.execute("ALTER TABLE image_history ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT ''")
+
+        task_columns = _table_columns(conn, "image_tasks")
+        if task_columns and "aspect_ratio" not in task_columns:
+            conn.execute("ALTER TABLE image_tasks ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT ''")
 
         ledger_columns = _table_columns(conn, "ledger_entries")
         if "owner_id" not in ledger_columns:
@@ -517,6 +525,7 @@ class Database:
             "prompt": payload["prompt"],
             "model": payload["model"],
             "size": payload["size"],
+            "aspect_ratio": payload.get("aspect_ratio") or "",
             "quality": payload["quality"],
             "status": payload["status"],
             "image_url": payload.get("image_url"),
@@ -534,12 +543,12 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO image_history (
-                    id, owner_id, mode, prompt, model, size, quality, status, image_url, image_path,
+                    id, owner_id, mode, prompt, model, size, aspect_ratio, quality, status, image_url, image_path,
                     input_image_url, input_image_path, revised_prompt, usage_json,
                     provider_response_json, error, created_at, updated_at
                 )
                 VALUES (
-                    :id, :owner_id, :mode, :prompt, :model, :size, :quality, :status, :image_url,
+                    :id, :owner_id, :mode, :prompt, :model, :size, :aspect_ratio, :quality, :status, :image_url,
                     :image_path, :input_image_url, :input_image_path, :revised_prompt,
                     :usage_json, :provider_response_json, :error, :created_at, :updated_at
                 )
@@ -624,6 +633,7 @@ class Database:
             "prompt": payload["prompt"],
             "model": payload["model"],
             "size": payload["size"],
+            "aspect_ratio": payload.get("aspect_ratio") or "",
             "quality": payload["quality"],
             "status": payload.get("status", "queued"),
             "request_json": _json_or_none(payload.get("request")),
@@ -641,12 +651,12 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO image_tasks (
-                    id, owner_id, mode, prompt, model, size, quality, status, request_json,
+                    id, owner_id, mode, prompt, model, size, aspect_ratio, quality, status, request_json,
                     input_image_url, input_image_path, result_history_ids_json, result_json, error,
                     created_at, updated_at, started_at, completed_at
                 )
                 VALUES (
-                    :id, :owner_id, :mode, :prompt, :model, :size, :quality, :status, :request_json,
+                    :id, :owner_id, :mode, :prompt, :model, :size, :aspect_ratio, :quality, :status, :request_json,
                     :input_image_url, :input_image_path, :result_history_ids_json, :result_json, :error,
                     :created_at, :updated_at, :started_at, :completed_at
                 )
@@ -778,6 +788,7 @@ class Database:
                         "mode": history["mode"],
                         "model": history["model"],
                         "size": history["size"],
+                        "aspect_ratio": history["aspect_ratio"],
                         "quality": history["quality"],
                         "history_created_at": history["created_at"],
                     }
