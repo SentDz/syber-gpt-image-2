@@ -24,6 +24,7 @@ class FakeProvider:
     def __init__(self) -> None:
         self.generated_payloads: list[dict[str, Any]] = []
         self.edited_fields: list[dict[str, Any]] = []
+        self.edited_images: list[list[tuple[str, bytes, str]]] = []
 
     async def test_connection(self, config: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "models": ["gpt-image-2"], "raw": {"data": [{"id": "gpt-image-2"}]}}
@@ -47,6 +48,7 @@ class FakeProvider:
         await asyncio.sleep(0.02)
         assert images
         self.edited_fields.append(fields)
+        self.edited_images.append(images)
         return {"created": 124, "data": [{"b64_json": PNG_B64}], "usage": {"total_tokens": 2}}
 
 
@@ -218,10 +220,10 @@ def test_generation_passes_resolution_ratio_and_quality(tmp_path: Path) -> None:
         task = wait_for_task(client, generated.json()["id"])
         item = task["items"][0]
         provider = client.app.state.provider
-        assert task["size"] == "2048x1152"
+        assert task["size"] == "2560x1440"
         assert task["aspect_ratio"] == "16:9"
         assert item["aspect_ratio"] == "16:9"
-        assert provider.generated_payloads[-1]["size"] == "2048x1152"
+        assert provider.generated_payloads[-1]["size"] == "2560x1440"
         assert "aspectRatio" not in provider.generated_payloads[-1]
         assert provider.generated_payloads[-1]["quality"] == "high"
 
@@ -287,17 +289,28 @@ def test_manual_override_ledger_keeps_estimated_cost(tmp_path: Path) -> None:
 
 
 def test_image_size_presets_follow_provider_limits() -> None:
-    assert _provider_image_size("1K", "16:9") == "1024x576"
-    assert _provider_image_size("2K", "16:9") == "2048x1152"
+    assert _provider_image_size("1K", "1:1") == "1088x1088"
+    assert _provider_image_size("1K", "16:9") == "2048x1152"
+    assert _provider_image_size("1K", "9:16") == "1152x2048"
+    assert _provider_image_size("1K", "3:2") == "1632x1088"
+    assert _provider_image_size("2K", "1:1") == "1440x1440"
+    assert _provider_image_size("2K", "16:9") == "2560x1440"
+    assert _provider_image_size("2K", "3:2") == "2160x1440"
     assert _provider_image_size("4K", "16:9") == "3840x2160"
+    with pytest.raises(HTTPException):
+        _provider_image_size("576x1024", "9:16")
+    with pytest.raises(HTTPException):
+        _provider_image_size("1080x1920", "9:16")
     with pytest.raises(HTTPException):
         _provider_image_size("4K", "1:1")
     with pytest.raises(HTTPException):
         _provider_image_size("3840x3840", "1:1")
     with pytest.raises(HTTPException):
         _provider_image_size("4096x4096", "1:1")
-    assert _image_size_tier("1024x1024") == "1K"
-    assert _image_size_tier("2048x1152") == "2K"
+    assert _image_size_tier("1088x1088") == "1K"
+    assert _image_size_tier("2048x1152") == "1K"
+    assert _image_size_tier("1440x1440") == "2K"
+    assert _image_size_tier("2560x1440") == "2K"
     assert _image_size_tier("2160x3840") == "4K"
 
 
@@ -308,15 +321,22 @@ def test_edit_persists_upload_and_result(tmp_path: Path) -> None:
         response = client.post(
             "/api/images/edit",
             data={"prompt": "make it cyberpunk"},
-            files={"image": ("source.png", b"fake-image", "image/png")},
+            files=[
+                ("image", ("source.png", b"fake-image", "image/png")),
+                ("image", ("style.png", b"fake-style", "image/png")),
+            ],
         )
 
         assert response.status_code == 200
         task = wait_for_task(client, response.json()["id"])
         item = task["items"][0]
+        provider = client.app.state.provider
         assert item["mode"] == "edit"
         assert item["input_image_url"].startswith("/storage/uploads/")
         assert Path(item["input_image_path"]).exists()
+        assert len(provider.edited_images[-1]) == 2
+        assert provider.edited_images[-1][0][0] == "source.png"
+        assert provider.edited_images[-1][1][0] == "style.png"
 
 
 def test_account_includes_balance_and_stats(tmp_path: Path) -> None:

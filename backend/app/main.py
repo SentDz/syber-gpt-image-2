@@ -45,22 +45,22 @@ class GenerateRequest(BaseModel):
 
 SIZE_PRESETS: dict[str, dict[str, str]] = {
     "1K": {
-        "1:1": "1024x1024",
-        "16:9": "1024x576",
-        "9:16": "576x1024",
-        "3:2": "1024x683",
-        "2:3": "683x1024",
-        "4:3": "1024x768",
-        "3:4": "768x1024",
-    },
-    "2K": {
-        "1:1": "2048x2048",
+        "1:1": "1088x1088",
         "16:9": "2048x1152",
         "9:16": "1152x2048",
-        "3:2": "2048x1365",
-        "2:3": "1365x2048",
-        "4:3": "2048x1536",
-        "3:4": "1536x2048",
+        "3:2": "1632x1088",
+        "2:3": "1088x1632",
+        "4:3": "1472x1104",
+        "3:4": "1104x1472",
+    },
+    "2K": {
+        "1:1": "1440x1440",
+        "16:9": "2560x1440",
+        "9:16": "1440x2560",
+        "3:2": "2160x1440",
+        "2:3": "1440x2160",
+        "4:3": "1920x1440",
+        "3:4": "1440x1920",
     },
     "4K": {
         "16:9": "3840x2160",
@@ -70,6 +70,10 @@ SIZE_PRESETS: dict[str, dict[str, str]] = {
         "4:3": "3840x2880",
         "3:4": "2880x3840",
     },
+}
+
+SIZE_TIER_BY_DIMENSION = {
+    dimension.lower(): scale for scale, ratios in SIZE_PRESETS.items() for dimension in ratios.values()
 }
 
 
@@ -908,6 +912,10 @@ def _provider_image_size(size: str, aspect_ratio: str | None = None) -> str:
     dimension_parts = cleaned_size.lower().split("x")
     if len(dimension_parts) == 2 and all(part.isdigit() for part in dimension_parts):
         width, height = (int(part) for part in dimension_parts)
+        if width * height < 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"Unsupported image size below minimum pixel budget: {cleaned_size}")
+        if width % 16 != 0 or height % 16 != 0:
+            raise HTTPException(status_code=400, detail=f"Unsupported image size, width and height must be divisible by 16: {cleaned_size}")
         if max(width, height) > 3840:
             raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
         if width == height and width > 2048:
@@ -917,6 +925,8 @@ def _provider_image_size(size: str, aspect_ratio: str | None = None) -> str:
 
 def _image_size_tier(size: str) -> str:
     cleaned_size = str(size or "").strip().lower()
+    if cleaned_size in SIZE_TIER_BY_DIMENSION:
+        return SIZE_TIER_BY_DIMENSION[cleaned_size]
     parts = cleaned_size.split("x")
     if len(parts) != 2 or not all(part.isdigit() for part in parts):
         tier = cleaned_size.upper()
@@ -924,10 +934,10 @@ def _image_size_tier(size: str) -> str:
             return tier
         return "2K"
     width, height = (int(part) for part in parts)
-    longest_edge = max(width, height)
-    if longest_edge <= 1024:
+    pixels = width * height
+    if pixels <= 1_400_000:
         return "1K"
-    if longest_edge <= 2048:
+    if pixels <= 4_300_000:
         return "2K"
     return "4K"
 

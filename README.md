@@ -6,7 +6,7 @@ Local services detected on this machine:
 
 - Sub2API: `http://127.0.0.1:9878`, OpenAI-compatible base URL `http://127.0.0.1:9878/v1`
 
-The app calls `/v1/images/generations` for generation, `/v1/images/edits` for edits, and reads balance/usage from `/v1/usage`. Per generation, the frontend lets users choose a scale such as `2K` and an aspect ratio such as `16:9`, then sends the concrete provider `size` as `WIDTHxHEIGHT` such as `2048x1152`. Scale buckets are based on the longest edge: `1K` stays at or below 1024px, `2K` at or below 2048px, and `4K` at or below 3840px. `4K + 1:1` is disabled because `3840x3840` exceeds the upstream pixel budget; direct square sizes above `2048x2048` are rejected by the backend. Use `2K + 1:1` for square images.
+The app calls `/v1/images/generations` for generation, `/v1/images/edits` for edits, and reads balance/usage from `/v1/usage`. Per generation, the frontend lets users choose a scale such as `1K (1080p)` or `2K (1440p)` and an aspect ratio such as `16:9`, then sends the concrete provider `size` as `WIDTHxHEIGHT`. The backend keeps dimensions aligned to the provider requirement that width and height are divisible by 16. For example, `1K + 9:16` uses `1152x2048` because exact `1080x1920` is rejected upstream, while `2K + 9:16` uses standard `1440x2560`. `4K + 1:1` is disabled because square sizes above `2048x2048` exceed the upstream pixel budget.
 
 Local billing ledger entries are written per generated image. Default prices are `IMAGE_PRICE_1K_USD=0.134`, `IMAGE_PRICE_2K_USD=0.201`, and `IMAGE_PRICE_4K_USD=0.268`; set these environment variables to match your JokoAI/Sub2API group pricing.
 

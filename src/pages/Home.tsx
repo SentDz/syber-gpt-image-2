@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
 import { ImagePlus, Grid, List, Maximize2, RefreshCw, Loader2, X } from 'lucide-react';
 import { editImage, generateImage, getConfig, getHistory, getInspirations, getInspirationStats, HistoryItem, InspirationItem } from '../api';
 import { useAuth } from '../auth';
@@ -9,26 +10,31 @@ import { useTasks } from '../tasks';
 
 const FEED_PAGE_SIZE = 24;
 const SIZE_OPTIONS = ['1K', '2K', '4K'];
+const SIZE_LABELS: Record<string, string> = {
+  '1K': '1K (1080p)',
+  '2K': '2K (1440p)',
+  '4K': '4K (2160p)',
+};
 const ASPECT_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
 const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
 const SIZE_PRESETS: Record<string, Record<string, string>> = {
   '1K': {
-    '1:1': '1024x1024',
-    '16:9': '1024x576',
-    '9:16': '576x1024',
-    '3:2': '1024x683',
-    '2:3': '683x1024',
-    '4:3': '1024x768',
-    '3:4': '768x1024',
-  },
-  '2K': {
-    '1:1': '2048x2048',
+    '1:1': '1088x1088',
     '16:9': '2048x1152',
     '9:16': '1152x2048',
-    '3:2': '2048x1365',
-    '2:3': '1365x2048',
-    '4:3': '2048x1536',
-    '3:4': '1536x2048',
+    '3:2': '1632x1088',
+    '2:3': '1088x1632',
+    '4:3': '1472x1104',
+    '3:4': '1104x1472',
+  },
+  '2K': {
+    '1:1': '1440x1440',
+    '16:9': '2560x1440',
+    '9:16': '1440x2560',
+    '3:2': '2160x1440',
+    '2:3': '1440x2160',
+    '4:3': '1920x1440',
+    '3:4': '1440x1920',
   },
   '4K': {
     '16:9': '3840x2160',
@@ -39,6 +45,11 @@ const SIZE_PRESETS: Record<string, Record<string, string>> = {
     '3:4': '2880x3840',
   },
 };
+const SIZE_BY_PRESET_VALUE = Object.fromEntries(
+  Object.entries(SIZE_PRESETS).flatMap(([scale, ratios]) =>
+    Object.values(ratios).map((size) => [size.toUpperCase(), scale]),
+  ),
+);
 
 function mergeHistory(items: HistoryItem[]) {
   const merged = new Map<string, HistoryItem>();
@@ -55,7 +66,8 @@ export default function Home() {
   const [promptValue, setPromptValue] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [inspirations, setInspirations] = useState<InspirationItem[]>([]);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedPreviews, setSelectedPreviews] = useState<{ id: string; name: string; url: string }[]>([]);
   const [imageScale, setImageScale] = useState('2K');
   const [aspectRatio, setAspectRatio] = useState('1:1');
   const [imageQuality, setImageQuality] = useState('auto');
@@ -70,6 +82,18 @@ export default function Home() {
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const previews = selectedFiles.map((file, index) => ({
+      id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      name: file.name,
+      url: URL.createObjectURL(file),
+    }));
+    setSelectedPreviews(previews);
+    return () => {
+      previews.forEach((preview) => URL.revokeObjectURL(preview.url));
+    };
+  }, [selectedFiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -174,20 +198,21 @@ export default function Home() {
     if (!prompt || loading) return;
     setLoading(true);
     setError('');
-    setMessage(selectedFile ? t('home_message_edit_sent') : t('home_message_generate_sent'));
+    const isEditMode = selectedFiles.length > 0;
+    setMessage(isEditMode ? t('home_message_edit_sent') : t('home_message_generate_sent'));
     const imageOptions = {
       size: providerImageSize(imageScale, aspectRatio),
       aspect_ratio: aspectRatio,
       quality: imageQuality,
     };
     try {
-      const submittedTask = selectedFile
-        ? await editImage({ prompt, ...imageOptions }, selectedFile)
+      const submittedTask = isEditMode
+        ? await editImage({ prompt, ...imageOptions }, selectedFiles)
         : await generateImage({ prompt, ...imageOptions });
       addTask(submittedTask);
       openDrawer();
       setMessage(submittedTask.status === 'running' ? t('home_message_processing') : t('home_message_queued'));
-      setSelectedFile(null);
+      setSelectedFiles([]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMessage('');
@@ -219,6 +244,16 @@ export default function Home() {
     if (nextRatio === '1:1' && imageScale === '4K') {
       setImageScale('2K');
     }
+  };
+  const handleReferenceImages = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length > 0) {
+      setSelectedFiles((current) => [...current, ...files]);
+    }
+    event.target.value = '';
+  };
+  const removeReferenceImage = (index: number) => {
+    setSelectedFiles((current) => current.filter((_, currentIndex) => currentIndex !== index));
   };
 
   return (
@@ -347,11 +382,12 @@ export default function Home() {
       <div className="fixed bottom-6 left-6 right-6 md:left-auto md:right-auto md:w-[calc(100%-3rem)] max-w-[960px] mx-auto bg-surface-container/90 backdrop-blur-xl border border-primary/40 p-5 rounded-sm shadow-[0_-20px_40px_rgba(0,0,0,0.8)] z-50 font-mono">
           <div className="flex items-center gap-4 mb-4">
             <div className="flex items-center gap-2 text-[10px] text-white/50 border-r border-white/10 pr-4">
-             <span className="w-2 h-2 bg-secondary rounded-full animate-pulse"></span> {t('home_mode')}: {selectedFile ? t('home_mode_edit') : t('home_mode_generate')}
+             <span className="w-2 h-2 bg-secondary rounded-full animate-pulse"></span> {t('home_mode')}: {selectedFiles.length ? t('home_mode_edit') : t('home_mode_generate')}
           </div>
           <div className="hidden items-center gap-2 text-[10px] uppercase tracking-widest text-white/45 md:flex">
-            <span>{imageScale}</span>
+            <span>{SIZE_LABELS[imageScale] || imageScale}</span>
             <span>{aspectRatio}</span>
+            <span>{providerImageSize(imageScale, aspectRatio)}</span>
             <span>{imageQuality}</span>
           </div>
           <div className="text-[10px] text-primary uppercase tracking-widest truncate">
@@ -365,6 +401,7 @@ export default function Home() {
             value={imageScale}
             onChange={setImageScale}
             options={SIZE_OPTIONS}
+            getOptionLabel={(option) => SIZE_LABELS[option] || option}
             isOptionDisabled={(option) => !isSupportedImagePreset(option, aspectRatio)}
           />
           <GenerationSelect label={t('home_aspect_ratio')} value={aspectRatio} onChange={handleAspectRatioChange} options={ASPECT_RATIO_OPTIONS} />
@@ -384,38 +421,56 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="flex gap-4">
-            <input
-              ref={fileInputRef}
-              className="hidden"
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="w-20 md:w-24 h-20 border border-dashed border-primary/20 flex flex-col items-center justify-center cursor-pointer hover:bg-primary/5 transition-colors group relative"
-            >
-              {selectedFile ? (
-                <>
-                  <X className="w-5 h-5 mb-1 text-secondary" />
-                  <span className="text-[9px] uppercase text-secondary px-1 truncate max-w-full">{selectedFile.name}</span>
-                </>
-              ) : (
-                <>
-                  <ImagePlus className="w-6 h-6 mb-1 text-white/30 group-hover:text-primary transition-colors" />
-                  <span className="text-[9px] uppercase text-white/40 group-hover:text-primary">{t('home_ref_image')}</span>
-                </>
+          <div className="flex min-w-0 flex-col gap-3 sm:flex-row">
+            <div className="flex min-w-0 gap-3">
+              <input
+                ref={fileInputRef}
+                className="hidden"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                multiple
+                onChange={handleReferenceImages}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="h-20 w-20 shrink-0 cursor-pointer border border-dashed border-primary/20 flex flex-col items-center justify-center hover:bg-primary/5 transition-colors group relative md:w-24"
+              >
+                <ImagePlus className="w-6 h-6 mb-1 text-white/30 group-hover:text-primary transition-colors" />
+                <span className="max-w-full truncate px-1 text-[9px] uppercase text-white/40 group-hover:text-primary">{t('home_ref_image')}</span>
+              </button>
+              {selectedPreviews.length > 0 && (
+                <div className="flex min-w-0 max-w-[calc(100vw-11rem)] gap-2 overflow-x-auto pb-1 pr-1 sm:max-w-64">
+                  {selectedPreviews.map((preview, index) => (
+                    <div key={preview.id} className="group/reference relative h-20 w-16 shrink-0 overflow-hidden border border-primary/20 bg-black">
+                      <button
+                        type="button"
+                        className="h-full w-full cursor-zoom-in bg-black"
+                        title={preview.name}
+                        onClick={() => setPreviewItem({ imageUrl: preview.url, prompt: preview.name })}
+                      >
+                        <img alt={preview.name} className="h-full w-full object-cover" src={preview.url} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={t('modal_close')}
+                        className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center border border-white/15 bg-black/70 text-white/80 opacity-100 transition-colors hover:border-error hover:text-error sm:opacity-0 sm:group-hover/reference:opacity-100"
+                        onClick={() => removeReferenceImage(index)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
-            </button>
+            </div>
             <button
               onClick={handleExecute}
               disabled={loading || !promptValue.trim()}
-              className="w-32 bg-primary text-black font-black flex flex-col items-center justify-center hover:scale-95 transition-transform shadow-[0_0_15px_rgba(0,243,255,0.4)] disabled:opacity-40 disabled:hover:scale-100"
+              className="h-20 w-full bg-primary text-black font-black flex flex-col items-center justify-center hover:scale-95 transition-transform shadow-[0_0_15px_rgba(0,243,255,0.4)] disabled:opacity-40 disabled:hover:scale-100 sm:w-32"
             >
               {loading ? <Loader2 className="animate-spin" size={24} /> : <span className="text-xl mb-[-4px]">{t('home_execute')}</span>}
-              <span className="text-[10px] opacity-70 italic">{selectedFile ? t('home_edit') : t('home_generate')}</span>
+              <span className="text-[10px] opacity-70 italic">{selectedFiles.length ? t('home_edit') : t('home_generate')}</span>
             </button>
           </div>
         </div>
@@ -437,12 +492,14 @@ function GenerationSelect({
   options,
   onChange,
   isOptionDisabled,
+  getOptionLabel,
 }: {
   label: string;
   value: string;
   options: string[];
   onChange: (value: string) => void;
   isOptionDisabled?: (value: string) => boolean;
+  getOptionLabel?: (value: string) => string;
 }) {
   return (
     <label className="min-w-0">
@@ -454,7 +511,7 @@ function GenerationSelect({
       >
         {options.map((option) => (
           <option key={option} value={option} disabled={isOptionDisabled?.(option) || false}>
-            {option}
+            {getOptionLabel?.(option) || option}
           </option>
         ))}
       </select>
@@ -466,6 +523,9 @@ function normalizeImageScale(value: string | undefined) {
   const normalized = (value || '').trim().toUpperCase();
   if (SIZE_OPTIONS.includes(normalized)) {
     return normalized;
+  }
+  if (SIZE_BY_PRESET_VALUE[normalized]) {
+    return SIZE_BY_PRESET_VALUE[normalized];
   }
   if (/^1\d{3}x1\d{3}$/i.test(normalized)) {
     return '1K';

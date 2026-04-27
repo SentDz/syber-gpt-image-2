@@ -355,15 +355,16 @@ export function generateImage(payload: GeneratePayload) {
   });
 }
 
-export function editImage(payload: GeneratePayload, image: File) {
+export function editImage(payload: GeneratePayload, images: File | File[]) {
   const form = new FormData();
+  const imageList = Array.isArray(images) ? images : [images];
   form.set('prompt', payload.prompt);
   if (payload.model) form.set('model', payload.model);
   if (payload.size) form.set('size', payload.size);
   if (payload.aspect_ratio) form.set('aspect_ratio', payload.aspect_ratio);
   if (payload.quality) form.set('quality', payload.quality);
   form.set('n', String(payload.n || 1));
-  form.set('image', image);
+  imageList.forEach((image) => form.append('image', image));
   return request<ImageTask>('/api/images/edit', {
     method: 'POST',
     body: form,

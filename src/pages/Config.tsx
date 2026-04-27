@@ -347,9 +347,9 @@ export default function Config() {
                     onChange={(event) => setConfig((current) => current && { ...current, default_size: event.target.value })}
                   />
                   <datalist id="image-size-options">
-                    <option value="1K" />
-                    <option value="2K" />
-                    <option value="4K" />
+                    <option value="1K" label="1K (1080p)" />
+                    <option value="2K" label="2K (1440p)" />
+                    <option value="4K" label="4K (2160p)" />
                   </datalist>
                 </>
               </Field>
