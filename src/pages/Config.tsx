@@ -507,7 +507,11 @@ export default function Config() {
               {ledger.map((item) => (
                 <div key={item.id} className="flex justify-between items-center py-3 border-b border-white/5">
                   <div className="flex flex-col">
-                    <span className="text-white">{item.description}</span>
+                    <span className="flex flex-wrap items-center gap-2 text-white">
+                      <span>{item.description}</span>
+                      {isActualLedger(item) && <span className="text-[8px] uppercase tracking-widest text-secondary">{t('billing_actual')}</span>}
+                      {isEstimatedLedger(item) && <span className="text-[8px] uppercase tracking-widest text-tertiary">{t('billing_estimated')}</span>}
+                    </span>
                     <span className="text-[9px] text-white/40 mt-1 uppercase">{formatDate(item.created_at)}</span>
                   </div>
                   <span className="text-secondary">{item.amount.toFixed(4)} {item.currency}</span>
@@ -523,6 +527,15 @@ export default function Config() {
       </div>
     </div>
   );
+}
+
+function isEstimatedLedger(item: LedgerEntry) {
+  const source = String(item.metadata?.cost_source || '');
+  return source.startsWith('local_image_price');
+}
+
+function isActualLedger(item: LedgerEntry) {
+  return item.metadata?.cost_source === 'sub2api_actual_cost';
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,6 +132,13 @@ class ViewerContext:
         return bool(user and user.get("role") == "admin")
 
 
+@dataclass(frozen=True)
+class ImageLedgerCost:
+    amount: float
+    source: str
+    usage_log: dict[str, Any] | None = None
+
+
 def create_app(
     settings: Settings | None = None,
     provider: OpenAICompatibleImageClient | None = None,
@@ -141,6 +149,7 @@ def create_app(
     db = Database(settings.database_path)
     db.init(settings)
     db.fail_incomplete_tasks("Worker restarted before the task completed")
+    _backfill_zero_amount_ledger(db, settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -810,6 +819,8 @@ async def _complete_auth_flow(
         username=str(user.get("username") or ""),
         role=str(user.get("role") or "user"),
         ttl_seconds=settings.session_ttl_seconds,
+        access_token=access_token,
+        refresh_token=str(auth_result.get("refresh_token") or ""),
         user_agent=request.headers.get("user-agent"),
         ip_address=_client_ip(request),
     )
@@ -904,6 +915,198 @@ def _provider_image_size(size: str, aspect_ratio: str | None = None) -> str:
     return cleaned_size
 
 
+def _image_size_tier(size: str) -> str:
+    cleaned_size = str(size or "").strip().lower()
+    parts = cleaned_size.split("x")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        tier = cleaned_size.upper()
+        if tier in {"1K", "2K", "4K"}:
+            return tier
+        return "2K"
+    width, height = (int(part) for part in parts)
+    longest_edge = max(width, height)
+    if longest_edge <= 1024:
+        return "1K"
+    if longest_edge <= 2048:
+        return "2K"
+    return "4K"
+
+
+def _image_ledger_amount(settings: Settings, size: str) -> float:
+    tier = _image_size_tier(size)
+    if tier == "1K":
+        return settings.image_price_1k
+    if tier == "4K":
+        return settings.image_price_4k
+    return settings.image_price_2k
+
+
+def _backfill_zero_amount_ledger(db: Database, settings: Settings) -> int:
+    updated = 0
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT le.id, le.metadata_json, ih.size, ih.aspect_ratio, ih.quality, ih.usage_json
+            FROM ledger_entries le
+            JOIN image_history ih ON ih.id = le.history_id
+            WHERE le.amount = 0
+              AND le.event_type IN ('generate', 'edit')
+              AND ih.status = 'succeeded'
+            """
+        ).fetchall()
+        for row in rows:
+            amount = _image_ledger_amount(settings, row["size"])
+            if amount <= 0:
+                continue
+            metadata = _json_object(row["metadata_json"])
+            metadata.update(
+                {
+                    "size": row["size"],
+                    "aspect_ratio": row["aspect_ratio"],
+                    "quality": row["quality"],
+                    "size_tier": _image_size_tier(row["size"]),
+                    "cost_source": "local_image_price_backfill",
+                    "usage": _json_object(row["usage_json"]),
+                }
+            )
+            conn.execute(
+                """
+                UPDATE ledger_entries
+                SET amount = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (amount, json.dumps(metadata, ensure_ascii=False), row["id"]),
+            )
+            updated += 1
+    return updated
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _provider_response_image_count(provider_response: dict[str, Any]) -> int:
+    data = provider_response.get("data")
+    if not isinstance(data, list):
+        return 1
+    return max(1, len([item for item in data if isinstance(item, dict)]))
+
+
+async def _resolve_image_ledger_cost(
+    db: Database,
+    settings: Settings,
+    auth_client: Sub2APIAuthClient,
+    *,
+    owner_id: str,
+    config: dict[str, Any],
+    model: str,
+    size: str,
+    image_count: int,
+) -> ImageLedgerCost:
+    if config.get("api_key_source") == "managed":
+        actual = await _sub2api_actual_image_ledger_cost(
+            db,
+            settings,
+            auth_client,
+            owner_id=owner_id,
+            model=model,
+            image_count=image_count,
+        )
+        if actual is not None:
+            return actual
+    return ImageLedgerCost(amount=_image_ledger_amount(settings, size), source="local_image_price")
+
+
+async def _sub2api_actual_image_ledger_cost(
+    db: Database,
+    settings: Settings,
+    auth_client: Sub2APIAuthClient,
+    *,
+    owner_id: str,
+    model: str,
+    image_count: int,
+) -> ImageLedgerCost | None:
+    session = db.latest_session_for_owner(owner_id)
+    access_token = str((session or {}).get("access_token") or "").strip()
+    if not access_token:
+        return None
+
+    params = {
+        "page": 1,
+        "page_size": 10,
+        "sort_by": "created_at",
+        "sort_order": "desc",
+        "model": model,
+    }
+    for attempt in range(5):
+        try:
+            logs = await auth_client.list_usage(settings.auth_base_url, access_token, params)
+        except ProviderError:
+            return None
+        usage_log = _select_sub2api_image_usage_log(logs, model)
+        if usage_log is not None:
+            total_cost = _float_or_none(usage_log.get("actual_cost"))
+            if total_cost is None:
+                total_cost = _float_or_none(usage_log.get("total_cost"))
+            if total_cost is not None:
+                divisor = max(1, int(usage_log.get("image_count") or image_count or 1))
+                return ImageLedgerCost(
+                    amount=round(max(0.0, total_cost) / divisor, 8),
+                    source="sub2api_actual_cost",
+                    usage_log=_compact_sub2api_usage_log(usage_log),
+                )
+        if attempt < 4:
+            await asyncio.sleep(0.3)
+    return None
+
+
+def _select_sub2api_image_usage_log(logs: list[dict[str, Any]], model: str) -> dict[str, Any] | None:
+    expected_model = str(model or "").strip().lower()
+    for item in logs:
+        if expected_model and str(item.get("model") or "").strip().lower() != expected_model:
+            continue
+        inbound_endpoint = str(item.get("inbound_endpoint") or "")
+        upstream_endpoint = str(item.get("upstream_endpoint") or "")
+        is_image = bool(item.get("image_count")) or bool(item.get("image_size")) or "images/" in inbound_endpoint or "images/" in upstream_endpoint
+        if is_image:
+            return item
+    return None
+
+
+def _compact_sub2api_usage_log(item: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "id",
+        "request_id",
+        "model",
+        "actual_cost",
+        "total_cost",
+        "image_count",
+        "image_size",
+        "billing_mode",
+        "created_at",
+    ]
+    return {key: item.get(key) for key in keys if key in item}
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dict[str, Any]:
     history_ids = task.get("result_history_ids") or []
     return {
@@ -958,6 +1161,7 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
     db: Database = app.state.db
     settings: Settings = app.state.settings
     provider: OpenAICompatibleImageClient = app.state.provider
+    auth_client: Sub2APIAuthClient = app.state.auth_client
 
     task = db.get_image_task_by_id(task_id)
     if task is None:
@@ -1001,6 +1205,16 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
             raise ValueError(f"Unsupported task mode: {task['mode']}")
 
         latest_task = db.get_image_task_by_id(task_id) or task
+        ledger_cost = await _resolve_image_ledger_cost(
+            db,
+            settings,
+            auth_client,
+            owner_id=latest_task["owner_id"],
+            config=config,
+            model=latest_task["model"],
+            size=latest_task["size"],
+            image_count=_provider_response_image_count(provider_response),
+        )
         items = await _persist_image_response(
             db,
             settings,
@@ -1012,6 +1226,7 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
             aspect_ratio=latest_task.get("aspect_ratio") or "",
             quality=latest_task["quality"],
             provider_response=provider_response,
+            ledger_cost=ledger_cost,
             input_image_url=latest_task.get("input_image_url"),
             input_image_path=latest_task.get("input_image_path"),
         )
@@ -1104,6 +1319,7 @@ async def _persist_image_response(
     aspect_ratio: str,
     quality: str,
     provider_response: dict[str, Any],
+    ledger_cost: ImageLedgerCost,
     input_image_url: str | None = None,
     input_image_path: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -1141,10 +1357,18 @@ async def _persist_image_response(
             owner_id,
             {
                 "event_type": mode,
-                "amount": 0,
+                "amount": ledger_cost.amount,
                 "description": f"{mode.upper()} {model}",
                 "history_id": record["id"],
-                "metadata": {"size": size, "aspect_ratio": aspect_ratio, "quality": quality},
+                "metadata": {
+                    "size": size,
+                    "aspect_ratio": aspect_ratio,
+                    "quality": quality,
+                    "size_tier": _image_size_tier(size),
+                    "cost_source": ledger_cost.source,
+                    "usage": provider_response.get("usage"),
+                    "sub2api_usage_log": ledger_cost.usage_log,
+                },
             },
         )
         records.append(record)

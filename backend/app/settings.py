@@ -37,6 +37,9 @@ class Settings:
     image_model: str
     default_size: str
     default_quality: str
+    image_price_1k: float
+    image_price_2k: float
+    image_price_4k: float
     user_name: str
     cors_origins: list[str]
     request_timeout_seconds: float
@@ -80,6 +83,9 @@ class Settings:
             image_model=os.getenv("IMAGE_MODEL", "gpt-image-2"),
             default_size=os.getenv("IMAGE_SIZE", "2K"),
             default_quality=os.getenv("IMAGE_QUALITY", "auto"),
+            image_price_1k=float(os.getenv("IMAGE_PRICE_1K_USD", "0.134")),
+            image_price_2k=float(os.getenv("IMAGE_PRICE_2K_USD", "0.201")),
+            image_price_4k=float(os.getenv("IMAGE_PRICE_4K_USD", "0.268")),
             user_name=os.getenv("APP_USER_NAME", "NEON_USER_404"),
             cors_origins=cors_origins,
             request_timeout_seconds=float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "300")),

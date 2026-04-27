@@ -8,6 +8,10 @@ Local services detected on this machine:
 
 The app calls `/v1/images/generations` for generation, `/v1/images/edits` for edits, and reads balance/usage from `/v1/usage`. Per generation, the frontend lets users choose a scale such as `2K` and an aspect ratio such as `16:9`, then sends the concrete provider `size` as `WIDTHxHEIGHT` such as `2048x1152`. Scale buckets are based on the longest edge: `1K` stays at or below 1024px, `2K` at or below 2048px, and `4K` at or below 3840px. `4K + 1:1` is disabled because `3840x3840` exceeds the upstream pixel budget; direct square sizes above `2048x2048` are rejected by the backend. Use `2K + 1:1` for square images.
 
+Local billing ledger entries are written per generated image. Default prices are `IMAGE_PRICE_1K_USD=0.134`, `IMAGE_PRICE_2K_USD=0.201`, and `IMAGE_PRICE_4K_USD=0.268`; set these environment variables to match your JokoAI/Sub2API group pricing.
+
+For signed-in users using the system-managed key, the backend reads recent JokoAI/Sub2API `/api/v1/usage` records and stores the real `actual_cost` when available. Signed-in users who override the key, and guests who manually enter a key, use the local image price estimate and are marked as estimated in the UI.
+
 Identity modes:
 
 - Guests get a local cookie-backed owner id. Their history and config are isolated per browser.

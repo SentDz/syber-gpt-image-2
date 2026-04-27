@@ -62,6 +62,22 @@ class Sub2APIAuthClient:
             raise ProviderError(502, "JokoAI 返回的 API Key 数据格式不正确", data)
         return data
 
+    async def list_usage(self, base_url: str, access_token: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        data = await self._request(
+            base_url,
+            "GET",
+            "/api/v1/usage",
+            params=params or {},
+            access_token=access_token,
+        )
+        if isinstance(data, dict):
+            items = data.get("items")
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
     async def _request(
         self,
         base_url: str,

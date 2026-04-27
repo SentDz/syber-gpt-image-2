@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.inspirations import cache_inspiration_images, normalize_inspiration_source_url, parse_inspiration_markdown
-from app.main import create_app, _auth_client, _db, _provider, _provider_image_size, _settings
+from app.main import create_app, _auth_client, _db, _image_size_tier, _provider, _provider_image_size, _settings
 from app.settings import Settings
 
 
@@ -53,6 +53,20 @@ class FakeProvider:
 class FakeAuthClient:
     def __init__(self) -> None:
         self.created_keys: list[dict[str, Any]] = []
+        self.usage_logs: list[dict[str, Any]] = [
+            {
+                "id": 501,
+                "request_id": "client:test",
+                "model": "gpt-image-2",
+                "actual_cost": 0.456,
+                "total_cost": 0.456,
+                "image_count": 1,
+                "image_size": "2K",
+                "inbound_endpoint": "/v1/images/generations",
+                "billing_mode": "image",
+                "created_at": "2026-04-26T10:00:00Z",
+            }
+        ]
 
     async def public_settings(self, base_url: str) -> dict[str, Any]:
         return {"registration_enabled": True, "email_verify_enabled": False, "backend_mode_enabled": False, "site_name": "demo"}
@@ -101,6 +115,9 @@ class FakeAuthClient:
         self.created_keys.append(key)
         return key
 
+    async def list_usage(self, base_url: str, access_token: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        return list(self.usage_logs)
+
 
 def make_app(tmp_path: Path, auth_client: FakeAuthClient | None = None):
     settings = Settings(
@@ -113,6 +130,9 @@ def make_app(tmp_path: Path, auth_client: FakeAuthClient | None = None):
         image_model="gpt-image-2",
         default_size="2K",
         default_quality="auto",
+        image_price_1k=0.134,
+        image_price_2k=0.201,
+        image_price_4k=0.268,
         user_name="tester",
         cors_origins=["http://127.0.0.1:3000"],
         request_timeout_seconds=10,
@@ -206,6 +226,66 @@ def test_generation_passes_resolution_ratio_and_quality(tmp_path: Path) -> None:
         assert provider.generated_payloads[-1]["quality"] == "high"
 
 
+def test_generation_records_nonzero_ledger_amount(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    with TestClient(app) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+
+        generated = client.post(
+            "/api/images/generate",
+            json={"prompt": "tall city", "size": "4K", "aspect_ratio": "9:16", "quality": "medium"},
+        )
+
+        assert generated.status_code == 200
+        task = wait_for_task(client, generated.json()["id"])
+        ledger = client.get("/api/ledger").json()["items"]
+        assert task["size"] == "2160x3840"
+        assert ledger[0]["history_id"] == task["items"][0]["id"]
+        assert ledger[0]["amount"] == 0.268
+        assert ledger[0]["metadata"]["size_tier"] == "4K"
+        assert ledger[0]["metadata"]["usage"] == {"total_tokens": 1}
+
+
+def test_managed_user_ledger_uses_sub2api_actual_cost(tmp_path: Path) -> None:
+    auth = FakeAuthClient()
+    auth.usage_logs[0]["actual_cost"] = 0.321
+    with make_client(tmp_path, auth_client=auth) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        generated = client.post(
+            "/api/images/generate",
+            json={"prompt": "managed billing", "size": "2K", "aspect_ratio": "1:1", "quality": "medium"},
+        )
+
+        assert generated.status_code == 200
+        wait_for_task(client, generated.json()["id"])
+        ledger = client.get("/api/ledger").json()["items"]
+        assert ledger[0]["amount"] == 0.321
+        assert ledger[0]["metadata"]["cost_source"] == "sub2api_actual_cost"
+        assert ledger[0]["metadata"]["sub2api_usage_log"]["actual_cost"] == 0.321
+
+
+def test_manual_override_ledger_keeps_estimated_cost(tmp_path: Path) -> None:
+    auth = FakeAuthClient()
+    with make_client(tmp_path, auth_client=auth) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+        overridden = client.put("/api/config", json={"api_key": "sk-shared-bonus-654321"})
+        assert overridden.json()["api_key_source"] == "manual_override"
+
+        generated = client.post(
+            "/api/images/generate",
+            json={"prompt": "shared key billing", "size": "2K", "aspect_ratio": "1:1", "quality": "medium"},
+        )
+
+        assert generated.status_code == 200
+        wait_for_task(client, generated.json()["id"])
+        ledger = client.get("/api/ledger").json()["items"]
+        assert ledger[0]["amount"] == 0.201
+        assert ledger[0]["metadata"]["cost_source"] == "local_image_price"
+
+
 def test_image_size_presets_follow_provider_limits() -> None:
     assert _provider_image_size("1K", "16:9") == "1024x576"
     assert _provider_image_size("2K", "16:9") == "2048x1152"
@@ -216,6 +296,9 @@ def test_image_size_presets_follow_provider_limits() -> None:
         _provider_image_size("3840x3840", "1:1")
     with pytest.raises(HTTPException):
         _provider_image_size("4096x4096", "1:1")
+    assert _image_size_tier("1024x1024") == "1K"
+    assert _image_size_tier("2048x1152") == "2K"
+    assert _image_size_tier("2160x3840") == "4K"
 
 
 def test_edit_persists_upload_and_result(tmp_path: Path) -> None:

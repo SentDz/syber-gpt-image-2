@@ -143,6 +143,8 @@ class Database:
                     email TEXT NOT NULL,
                     username TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL DEFAULT 'user',
+                    access_token TEXT NOT NULL DEFAULT '',
+                    refresh_token TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
@@ -204,6 +206,10 @@ class Database:
         session_columns = _table_columns(conn, "user_sessions")
         if session_columns and "role" not in session_columns:
             conn.execute("ALTER TABLE user_sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        if session_columns and "access_token" not in session_columns:
+            conn.execute("ALTER TABLE user_sessions ADD COLUMN access_token TEXT NOT NULL DEFAULT ''")
+        if session_columns and "refresh_token" not in session_columns:
+            conn.execute("ALTER TABLE user_sessions ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''")
 
         image_columns = _table_columns(conn, "image_history")
         if "owner_id" not in image_columns:
@@ -905,6 +911,8 @@ class Database:
         username: str,
         role: str,
         ttl_seconds: int,
+        access_token: str = "",
+        refresh_token: str = "",
         user_agent: str | None = None,
         ip_address: str | None = None,
     ) -> dict[str, Any]:
@@ -916,6 +924,8 @@ class Database:
             "email": email,
             "username": username or "",
             "role": role or "user",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
             "created_at": now,
             "updated_at": now,
             "expires_at": utc_after(ttl_seconds),
@@ -926,11 +936,11 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO user_sessions (
-                    id, owner_id, sub2api_user_id, email, username, role,
+                    id, owner_id, sub2api_user_id, email, username, role, access_token, refresh_token,
                     created_at, updated_at, expires_at, user_agent, ip_address
                 )
                 VALUES (
-                    :id, :owner_id, :sub2api_user_id, :email, :username, :role,
+                    :id, :owner_id, :sub2api_user_id, :email, :username, :role, :access_token, :refresh_token,
                     :created_at, :updated_at, :expires_at, :user_agent, :ip_address
                 )
                 """,
@@ -948,6 +958,27 @@ class Database:
             data = dict(row)
             if _is_expired(data["expires_at"]):
                 conn.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
+                return None
+            return data
+
+    def latest_session_for_owner(self, owner_id: str) -> dict[str, Any] | None:
+        if not owner_id:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM user_sessions
+                WHERE owner_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (owner_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            data = dict(row)
+            if _is_expired(data["expires_at"]):
+                conn.execute("DELETE FROM user_sessions WHERE id = ?", (data["id"],))
                 return None
             return data
 
