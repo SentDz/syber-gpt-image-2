@@ -418,8 +418,8 @@ docker compose build
 - 作者 / 站主：Joko
 - QQ：935764227
 - Telegram：https://t.me/jokoacoount
-- 交流群：请通过 QQ 或 Telegram 联系站主获取
-- 中转站 / 充值站点：https://ai.get-money.locker
+- 交流群：1076496247
+- 中转站 ：https://ai.get-money.locker
 
 ## 开源协议
 
