@@ -411,3 +411,22 @@ docker compose build
 - 品牌名和 Logo
 
 不要提交真实 `.env`、API Key、GitHub Token、数据库和图片存储目录。
+
+## 作者与交流
+
+- 项目品牌：JokoAI / joko-image
+- 作者 / 站主：Joko
+- QQ：935764227
+- Telegram：https://t.me/jokoacoount
+- 交流群：请通过 QQ 或 Telegram 联系站主获取
+- 中转站 / 充值站点：https://ai.get-money.locker
+
+## 开源协议
+
+本项目采用 MIT License 开源协议。
+
+你可以自由使用、复制、修改、合并、发布、分发、再授权或销售本项目副本；使用时请保留原始版权声明和许可声明。项目按“现状”提供，不附带任何明示或暗示担保。
+
+## Friendly Links
+
+[![LINUXDO](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LINUXDO-0086c9?style=for-the-badge&labelColor=555555)](https://linux.do)
