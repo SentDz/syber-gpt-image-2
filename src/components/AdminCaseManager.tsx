@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, Heart, Loader2, MessageCircle, Save, Search,
 import {
   CaseComment,
   CaseItem,
+  deleteAdminCase,
   deleteCaseComment,
   formatDate,
   listAdminCaseComments,
@@ -48,6 +49,8 @@ export default function AdminCaseManager() {
   const [likeDraft, setLikeDraft] = useState('');
   const [savingLikes, setSavingLikes] = useState(false);
   const [deletingCommentId, setDeletingCommentId] = useState('');
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deletingCase, setDeletingCase] = useState(false);
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const pages = useMemo(() => visiblePages(page, pageCount), [page, pageCount]);
@@ -115,6 +118,7 @@ export default function AdminCaseManager() {
     setDialogError('');
     setMessage('');
     setComments([]);
+    setDeleteConfirmOpen(false);
     loadComments(item.id);
   }
 
@@ -152,6 +156,24 @@ export default function AdminCaseManager() {
       setDialogError(err instanceof Error ? err.message : String(err));
     } finally {
       setDeletingCommentId('');
+    }
+  }
+
+  async function handleDeleteCase() {
+    if (!selectedCase) return;
+    setDeletingCase(true);
+    setDialogError('');
+    try {
+      const deleted = await deleteAdminCase(selectedCase.id);
+      setItems((current) => current.map((item) => (item.id === deleted.id ? deleted : item)));
+      setSelectedCase(null);
+      setDeleteConfirmOpen(false);
+      setMessage(t('case_admin_deleted'));
+      await loadCases(page, query);
+    } catch (err) {
+      setDialogError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingCase(false);
     }
   }
 
@@ -457,6 +479,46 @@ export default function AdminCaseManager() {
                       </div>
                     ))}
                   </div>
+                </div>
+
+                <div className="border border-secondary/25 bg-secondary/5 p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-secondary">{t('case_admin_delete_case')}</div>
+                    <button
+                      className="flex h-9 items-center gap-2 border border-secondary/35 px-3 text-[10px] font-bold uppercase tracking-widest text-secondary transition-colors hover:bg-secondary/10 disabled:opacity-35"
+                      disabled={selectedCase.status === 'deleted' || deletingCase}
+                      type="button"
+                      onClick={() => setDeleteConfirmOpen(true)}
+                    >
+                      <Trash2 size={13} />
+                      {t('case_admin_delete_case')}
+                    </button>
+                  </div>
+                  {deleteConfirmOpen ? (
+                    <div className="border border-secondary/35 bg-black/25 p-3">
+                      <div className="text-sm font-bold text-white">{t('case_admin_delete_confirm_title')}</div>
+                      <p className="mt-2 text-xs leading-5 text-on-surface-variant">{t('case_admin_delete_confirm_body')}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          className="h-9 border border-white/15 px-3 text-[10px] uppercase tracking-widest text-on-surface-variant transition-colors hover:border-primary hover:text-primary"
+                          disabled={deletingCase}
+                          type="button"
+                          onClick={() => setDeleteConfirmOpen(false)}
+                        >
+                          {t('history_delete_confirm_cancel')}
+                        </button>
+                        <button
+                          className="flex h-9 items-center gap-2 border border-secondary bg-secondary px-3 text-[10px] font-bold uppercase tracking-widest text-white transition-colors hover:bg-white hover:text-black disabled:opacity-50"
+                          disabled={deletingCase}
+                          type="button"
+                          onClick={handleDeleteCase}
+                        >
+                          {deletingCase ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                          {t('case_admin_delete_confirm_action')}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
 
                 {dialogError ? (
