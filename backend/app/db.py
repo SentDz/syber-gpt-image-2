@@ -24,7 +24,7 @@ QQ：935764227
 Telegram：请在后台配置
 
 中转站 / 充值站点：
-https://ai.get-money.locker
+https://geekai.live/purchase
 
 如需充值、额度支持或账号协助，请通过以上方式联系。"""
 OLD_JIKE_ANNOUNCEMENT_BODY_WITH_JOKO_CONTACT = """欢迎使用 即刻 图像生态系统。
@@ -212,6 +212,7 @@ class Database:
                     status TEXT NOT NULL CHECK (status IN ('visible', 'hidden', 'deleted')),
                     source_type TEXT NOT NULL CHECK (source_type IN ('user_history', 'admin_manual')),
                     created_by_admin INTEGER NOT NULL DEFAULT 0,
+                    like_count_adjustment INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -297,6 +298,10 @@ class Database:
             conn.execute("ALTER TABLE site_settings ADD COLUMN provider_base_url TEXT NOT NULL DEFAULT ''")
         if "auth_base_url" not in site_settings_columns:
             conn.execute("ALTER TABLE site_settings ADD COLUMN auth_base_url TEXT NOT NULL DEFAULT ''")
+
+        public_case_columns = _table_columns(conn, "public_cases")
+        if public_case_columns and "like_count_adjustment" not in public_case_columns:
+            conn.execute("ALTER TABLE public_cases ADD COLUMN like_count_adjustment INTEGER NOT NULL DEFAULT 0")
 
         self._ensure_site_settings(conn, settings)
 
@@ -876,6 +881,24 @@ class Database:
             ).fetchall()
         return {str(row["path"]) for row in rows if row["path"]}
 
+    def delete_public_cases_by_image_paths(self, paths: list[str]) -> int:
+        candidates = sorted({str(path).strip() for path in paths if str(path).strip()})
+        if not candidates:
+            return 0
+        placeholders = ", ".join("?" for _ in candidates)
+        with self.connect() as conn:
+            result = conn.execute(
+                f"""
+                UPDATE public_cases
+                SET status = 'deleted',
+                    updated_at = ?
+                WHERE status != 'deleted'
+                  AND image_path IN ({placeholders})
+                """,
+                (utc_now(), *candidates),
+            )
+            return int(result.rowcount or 0)
+
     def _cleanup_task_history_refs(
         self,
         conn: sqlite3.Connection,
@@ -1055,6 +1078,25 @@ class Database:
             record = _history_row(row)
             items[record["id"]] = record
         return [items[item_id] for item_id in history_ids if item_id in items]
+
+    def clear_history_input_images(self, owner_id: str, history_ids: list[str]) -> int:
+        cleaned_ids = [str(item_id) for item_id in history_ids if str(item_id).strip()]
+        if not cleaned_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in cleaned_ids)
+        with self.connect() as conn:
+            result = conn.execute(
+                f"""
+                UPDATE image_history
+                SET input_image_url = NULL,
+                    input_image_path = NULL,
+                    updated_at = ?
+                WHERE owner_id = ?
+                  AND id IN ({placeholders})
+                """,
+                (utc_now(), owner_id, *cleaned_ids),
+            )
+            return int(result.rowcount or 0)
 
     def publish_history_as_case(self, owner_id: str, history_id: str, author: str) -> dict[str, Any] | None:
         now = utc_now()
@@ -1336,7 +1378,7 @@ class Database:
                 """,
                 (*params, limit, offset),
             ).fetchall()
-            return [_case_row(conn, row, viewer_owner_id) for row in rows]
+            return [_case_row(conn, row, viewer_owner_id, mask_author=True) for row in rows]
 
     def count_public_cases(self, q: str = "") -> int:
         clauses = ["p.status = 'visible'", "p.image_url IS NOT NULL", "p.image_url != ''"]
@@ -1373,12 +1415,31 @@ class Database:
                 SELECT *
                 FROM public_cases
                 {where}
-                ORDER BY updated_at DESC, created_at DESC
+                ORDER BY created_at DESC, updated_at DESC
                 LIMIT ? OFFSET ?
                 """,
                 (*params, limit, offset),
             ).fetchall()
-            return [_case_row(conn, row, None) for row in rows]
+            return [_case_row(conn, row, None, mask_author=False) for row in rows]
+
+    def count_admin_cases(self, q: str = "") -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if q.strip():
+            search = f"%{q.strip().lower()}%"
+            clauses.append("(lower(title) LIKE ? OR lower(prompt) LIKE ? OR lower(COALESCE(author, '')) LIKE ?)")
+            params.extend([search, search, search])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM public_cases
+                {where}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"] or 0) if row else 0
 
     def get_public_case(
         self,
@@ -1386,6 +1447,7 @@ class Database:
         viewer_owner_id: str | None = None,
         *,
         include_hidden: bool = False,
+        mask_author: bool = True,
     ) -> dict[str, Any] | None:
         with self.connect() as conn:
             if include_hidden:
@@ -1395,7 +1457,7 @@ class Database:
                     "SELECT * FROM public_cases WHERE id = ? AND status = 'visible'",
                     (case_id,),
                 ).fetchone()
-            return _case_row(conn, row, viewer_owner_id) if row else None
+            return _case_row(conn, row, viewer_owner_id, mask_author=mask_author) if row else None
 
     def public_case_stats(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -1453,6 +1515,7 @@ class Database:
             "status": str(payload.get("status") or "visible").strip(),
             "source_type": "admin_manual",
             "created_by_admin": 1,
+            "like_count_adjustment": 0,
             "created_at": now,
             "updated_at": now,
         }
@@ -1462,18 +1525,18 @@ class Database:
                 INSERT INTO public_cases (
                     id, owner_id, history_id, title, author, prompt, image_url, image_path,
                     model, size, aspect_ratio, quality, status, source_type, created_by_admin,
-                    created_at, updated_at
+                    like_count_adjustment, created_at, updated_at
                 )
                 VALUES (
                     :id, :owner_id, :history_id, :title, :author, :prompt, :image_url, :image_path,
                     :model, :size, :aspect_ratio, :quality, :status, :source_type, :created_by_admin,
-                    :created_at, :updated_at
+                    :like_count_adjustment, :created_at, :updated_at
                 )
                 """,
                 record,
             )
             row = conn.execute("SELECT * FROM public_cases WHERE id = ?", (record["id"],)).fetchone()
-            return _case_row(conn, row, owner_id)
+            return _case_row(conn, row, owner_id, mask_author=False)
 
     def update_case(self, case_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
@@ -1490,7 +1553,7 @@ class Database:
         }
         updates = {key: value for key, value in payload.items() if key in allowed and value is not None}
         if not updates:
-            return self.get_public_case(case_id, include_hidden=True)
+            return self.get_public_case(case_id, include_hidden=True, mask_author=False)
         updates["updated_at"] = utc_now()
         with self.connect() as conn:
             row = conn.execute("SELECT id FROM public_cases WHERE id = ?", (case_id,)).fetchone()
@@ -1499,7 +1562,30 @@ class Database:
             assignments = ", ".join(f"{key} = ?" for key in updates)
             conn.execute(f"UPDATE public_cases SET {assignments} WHERE id = ?", (*updates.values(), case_id))
             updated = conn.execute("SELECT * FROM public_cases WHERE id = ?", (case_id,)).fetchone()
-            return _case_row(conn, updated, None)
+            return _case_row(conn, updated, None, mask_author=False)
+
+    def set_case_like_count(self, case_id: str, like_count: int) -> dict[str, Any] | None:
+        target_count = max(0, int(like_count))
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM public_cases WHERE id = ?", (case_id,)).fetchone()
+            if row is None:
+                return None
+            likes = conn.execute(
+                "SELECT COUNT(*) AS count FROM case_likes WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            real_count = int(likes["count"] or 0)
+            conn.execute(
+                """
+                UPDATE public_cases
+                SET like_count_adjustment = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (target_count - real_count, utc_now(), case_id),
+            )
+            updated = conn.execute("SELECT * FROM public_cases WHERE id = ?", (case_id,)).fetchone()
+            return _case_row(conn, updated, None, mask_author=False)
 
     def like_case(self, case_id: str, owner_id: str) -> dict[str, Any] | None:
         now = utc_now()
@@ -1839,15 +1925,24 @@ def _image_task_row(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def _case_row(conn: sqlite3.Connection, row: sqlite3.Row, viewer_owner_id: str | None = None) -> dict[str, Any]:
+def _case_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    viewer_owner_id: str | None = None,
+    *,
+    mask_author: bool = True,
+) -> dict[str, Any]:
     data = dict(row)
+    like_count_adjustment = int(data.pop("like_count_adjustment", 0) or 0)
+    if mask_author:
+        data["author"] = _mask_public_author(data.get("author"))
     data["created_by_admin"] = bool(data.get("created_by_admin"))
     like_row = conn.execute("SELECT COUNT(*) AS count FROM case_likes WHERE case_id = ?", (data["id"],)).fetchone()
     comment_row = conn.execute(
         "SELECT COUNT(*) AS count FROM case_comments WHERE case_id = ? AND status = 'visible'",
         (data["id"],),
     ).fetchone()
-    data["like_count"] = int(like_row["count"] or 0)
+    data["like_count"] = max(0, int(like_row["count"] or 0) + like_count_adjustment)
     data["comment_count"] = int(comment_row["count"] or 0)
     data["liked"] = False
     if viewer_owner_id:
@@ -1861,7 +1956,10 @@ def _case_row(conn: sqlite3.Connection, row: sqlite3.Row, viewer_owner_id: str |
 
 def _public_case_order_by(sort: str) -> str:
     if sort == "likes":
-        return "(SELECT COUNT(*) FROM case_likes cl WHERE cl.case_id = p.id) DESC, p.created_at DESC, p.updated_at DESC"
+        return (
+            "MAX(0, (SELECT COUNT(*) FROM case_likes cl WHERE cl.case_id = p.id) + "
+            "COALESCE(p.like_count_adjustment, 0)) DESC, p.created_at DESC, p.updated_at DESC"
+        )
     if sort == "comments":
         return (
             "(SELECT COUNT(*) FROM case_comments cc WHERE cc.case_id = p.id AND cc.status = 'visible') DESC, "

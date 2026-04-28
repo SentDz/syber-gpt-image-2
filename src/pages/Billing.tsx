@@ -7,7 +7,7 @@ import { useSite } from '../site';
 export default function Billing() {
   const { viewer } = useAuth();
   const { t } = useSite();
-  const rechargeUrl = 'https://ai.get-money.locker';
+  const rechargeUrl = 'https://geekai.live/purchase';
   const [balance, setBalance] = useState<BalanceInfo>();
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [error, setError] = useState('');

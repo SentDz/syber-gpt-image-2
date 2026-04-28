@@ -1,6 +1,6 @@
 import { Link, useLocation } from 'react-router-dom';
 import { useEffect, useState } from 'react';
-import { Bell, CreditCard, History, ListTodo, LogOut, Menu, Terminal, UserCircle, X, Zap } from 'lucide-react';
+import { Bell, CreditCard, History, Images, ListTodo, LogOut, Menu, Terminal, UserCircle, X, Zap } from 'lucide-react';
 import { AccountInfo, formatBalance, getAccount, logoutAccount } from '../api';
 import { useAuth } from '../auth';
 import { useSite } from '../site';
@@ -38,12 +38,13 @@ export default function TopNavBar() {
   const viewerLabel = viewer?.authenticated
     ? (viewer.user?.username || viewer.user?.email || 'USER')
     : t('home_guest', { value: viewer?.guest_id?.slice(0, 8) || '--' });
-  const rechargeUrl = 'https://ai.get-money.locker';
+  const rechargeUrl = 'https://geekai.live/purchase';
   const mobileNavItems = [
     { name: t('side_generate'), path: '/', icon: Zap },
     { name: t('side_history'), path: '/history', icon: History },
     { name: t('side_account'), path: '/account', icon: UserCircle },
     { name: t('side_config'), path: '/config', icon: Terminal },
+    ...(siteSettings?.viewer.is_admin ? [{ name: t('side_case_admin'), path: '/case-admin', icon: Images }] : []),
     { name: t('side_billing'), path: '/billing', icon: CreditCard },
   ];
 

@@ -165,6 +165,10 @@ class AdminCaseUpdate(BaseModel):
     status: str | None = None
 
 
+class AdminCaseLikeUpdate(BaseModel):
+    like_count: int = Field(ge=0, le=1_000_000)
+
+
 @dataclass
 class ViewerContext:
     owner_id: str
@@ -726,7 +730,14 @@ def create_app(
         db: Database = Depends(_db),
     ) -> dict[str, Any]:
         _require_admin(viewer)
-        return {"items": db.list_admin_cases(limit=limit, offset=offset, q=q)}
+        safe_limit = max(1, min(limit, 200))
+        safe_offset = max(0, offset)
+        return {
+            "items": db.list_admin_cases(limit=safe_limit, offset=safe_offset, q=q),
+            "total": db.count_admin_cases(q=q),
+            "limit": safe_limit,
+            "offset": safe_offset,
+        }
 
     @app.post("/api/admin/cases")
     async def admin_create_case(
@@ -742,20 +753,57 @@ def create_app(
             raise HTTPException(status_code=400, detail="Case image URL is required")
         return db.create_admin_case(viewer.owner_id, _viewer_name(viewer, settings), data)
 
+    @app.get("/api/admin/cases/{case_id}/comments")
+    async def admin_case_comments(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        case = db.get_public_case(case_id, viewer.owner_id, include_hidden=True)
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return {"items": db.list_case_comments(case_id, viewer.owner_id, is_admin=True)}
+
+    @app.put("/api/admin/cases/{case_id}/likes")
+    async def admin_update_case_likes(
+        case_id: str,
+        payload: AdminCaseLikeUpdate,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        item = db.set_case_like_count(case_id, payload.like_count)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
     @app.put("/api/admin/cases/{case_id}")
     async def admin_update_case(
         case_id: str,
         payload: AdminCaseUpdate,
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
     ) -> dict[str, Any]:
         _require_admin(viewer)
         data = payload.model_dump(exclude_unset=True)
         if "status" in data:
             data["status"] = _validate_case_status(data["status"])
+        current = (
+            db.get_public_case(case_id, viewer.owner_id, include_hidden=True, mask_author=False)
+            if data.get("status") == "deleted"
+            else None
+        )
         item = db.update_case(case_id, data)
         if item is None:
             raise HTTPException(status_code=404, detail="Case not found")
+        if data.get("status") == "deleted":
+            file_paths = [str(current.get("image_path") or "").strip()] if current else []
+            return {
+                **item,
+                **_cleanup_removed_image_files(db, settings, file_paths),
+            }
         return item
 
     @app.delete("/api/admin/cases/{case_id}")
@@ -763,12 +811,18 @@ def create_app(
         case_id: str,
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
     ) -> dict[str, Any]:
         _require_admin(viewer)
+        current = db.get_public_case(case_id, viewer.owner_id, include_hidden=True, mask_author=False)
+        file_paths = [str(current.get("image_path") or "").strip()] if current else []
         item = db.update_case(case_id, {"status": "deleted"})
         if item is None:
             raise HTTPException(status_code=404, detail="Case not found")
-        return item
+        return {
+            **item,
+            **_cleanup_removed_image_files(db, settings, file_paths),
+        }
 
     @app.get("/api/admin/comments")
     async def admin_comments(
@@ -835,14 +889,9 @@ def create_app(
         deleted = db.delete_history(viewer.owner_id, history_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="History item not found")
-        referenced_paths = db.referenced_storage_paths(file_paths)
-        deletable_paths = [path for path in file_paths if path not in referenced_paths]
-        file_stats = delete_storage_files(settings, deletable_paths)
         return {
             "ok": True,
-            "candidate_files": len(file_paths),
-            "protected_files": len(referenced_paths),
-            **file_stats,
+            **_cleanup_removed_image_files(db, settings, file_paths, delete_cases_by_path=True),
         }
 
     @app.post("/api/history/{history_id}/publish")
@@ -1535,6 +1584,26 @@ def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dic
     }
 
 
+def _cleanup_removed_image_files(
+    db: Database,
+    settings: Settings,
+    file_paths: list[str],
+    *,
+    delete_cases_by_path: bool = False,
+) -> dict[str, Any]:
+    candidates = sorted({str(path).strip() for path in file_paths if str(path).strip()})
+    deleted_linked_cases = db.delete_public_cases_by_image_paths(candidates) if delete_cases_by_path else 0
+    referenced_paths = db.referenced_storage_paths(candidates)
+    deletable_paths = [path for path in candidates if path not in referenced_paths]
+    file_stats = delete_storage_files(settings, deletable_paths)
+    return {
+        "candidate_files": len(candidates),
+        "protected_files": len(referenced_paths),
+        "deleted_linked_cases": deleted_linked_cases,
+        **file_stats,
+    }
+
+
 async def _cleanup_expired_images_loop(app: FastAPI) -> None:
     interval = max(60, int(getattr(app.state.settings, "image_cleanup_interval_seconds", 6 * 60 * 60)))
     while True:
@@ -1764,6 +1833,105 @@ async def _run_image_task(app: FastAPI, task_id: str) -> None:
                 "error": str(exc),
             },
         )
+    finally:
+        try:
+            _cleanup_edit_reference_uploads(db, settings, task_id, task)
+        except Exception:
+            logger.exception("Failed to cleanup edit reference uploads for task %s", task_id)
+
+
+def _cleanup_edit_reference_uploads(
+    db: Database,
+    settings: Settings,
+    task_id: str,
+    fallback_task: dict[str, Any],
+) -> dict[str, Any]:
+    task = db.get_image_task_by_id(task_id) or fallback_task
+    if task.get("mode") != "edit":
+        return {"candidate_files": 0, "deleted_files": 0}
+
+    paths = _edit_reference_upload_paths(task)
+    if not paths:
+        return {"candidate_files": 0, "deleted_files": 0}
+
+    owner_id = str(task.get("owner_id") or "")
+    history_ids = [str(item_id) for item_id in (task.get("result_history_ids") or []) if str(item_id).strip()]
+    if owner_id and history_ids:
+        db.clear_history_input_images(owner_id, history_ids)
+
+    request_payload = task.get("request")
+    db.update_image_task(
+        task_id,
+        {
+            "input_image_url": None,
+            "input_image_path": None,
+            "request": _strip_reference_uploads_from_request(request_payload),
+        },
+    )
+
+    referenced_paths = db.referenced_storage_paths(paths)
+    deletable_paths = [path for path in paths if path not in referenced_paths]
+    file_stats = delete_storage_files(settings, deletable_paths)
+    if file_stats.get("deleted_files") or file_stats.get("file_errors"):
+        logger.info(
+            "Edit reference cleanup completed for task %s: %s",
+            task_id,
+            {
+                "candidate_files": len(paths),
+                "protected_files": len(referenced_paths),
+                **file_stats,
+            },
+        )
+    return {
+        "candidate_files": len(paths),
+        "protected_files": len(referenced_paths),
+        **file_stats,
+    }
+
+
+def _edit_reference_upload_paths(task: dict[str, Any]) -> list[str]:
+    paths: set[str] = set()
+    input_path = str(task.get("input_image_path") or "").strip()
+    if input_path:
+        paths.add(input_path)
+    request_payload = task.get("request")
+    if isinstance(request_payload, dict):
+        uploads = request_payload.get("uploads")
+        if isinstance(uploads, list):
+            for upload in uploads:
+                if isinstance(upload, dict):
+                    path = str(upload.get("path") or "").strip()
+                    if path:
+                        paths.add(path)
+        mask = request_payload.get("mask")
+        if isinstance(mask, dict):
+            path = str(mask.get("path") or "").strip()
+            if path:
+                paths.add(path)
+    return sorted(paths)
+
+
+def _strip_reference_uploads_from_request(request_payload: Any) -> Any:
+    if not isinstance(request_payload, dict):
+        return request_payload
+    sanitized = dict(request_payload)
+    uploads = sanitized.get("uploads")
+    if isinstance(uploads, list):
+        sanitized["uploads"] = [
+            _strip_saved_upload_reference(upload) if isinstance(upload, dict) else upload
+            for upload in uploads
+        ]
+    mask = sanitized.get("mask")
+    if isinstance(mask, dict):
+        sanitized["mask"] = _strip_saved_upload_reference(mask)
+    return sanitized
+
+
+def _strip_saved_upload_reference(upload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(upload)
+    sanitized.pop("path", None)
+    sanitized.pop("url", None)
+    return sanitized
 
 
 async def _persist_image_response(

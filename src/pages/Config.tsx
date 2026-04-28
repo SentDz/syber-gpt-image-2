@@ -15,7 +15,6 @@ import {
   updateSiteSettings,
 } from '../api';
 import { useAuth } from '../auth';
-import AdminCaseManager from '../components/AdminCaseManager';
 import AvatarBadge from '../components/AvatarBadge';
 import { useSite } from '../site';
 
@@ -489,8 +488,6 @@ export default function Config() {
             </Link>
           </div>
         </div>
-
-        {siteSettings?.viewer.is_admin ? <AdminCaseManager /> : null}
       </div>
     </div>
   );

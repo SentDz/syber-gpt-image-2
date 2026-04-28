@@ -140,6 +140,13 @@ export type CaseListResponse = {
   sort: CaseSort;
 };
 
+export type AdminCaseListResponse = {
+  items: CaseItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 export type BalanceInfo = {
   ok: boolean;
   remaining: number | null;
@@ -416,7 +423,7 @@ export function listAdminCases(params: { limit?: number; offset?: number; q?: st
   if (params.offset) search.set('offset', String(params.offset));
   if (params.q) search.set('q', params.q);
   const query = search.toString();
-  return request<{ items: CaseItem[] }>(`/api/admin/cases${query ? `?${query}` : ''}`);
+  return request<AdminCaseListResponse>(`/api/admin/cases${query ? `?${query}` : ''}`);
 }
 
 export function createAdminCase(payload: Partial<CaseItem> & { title: string; prompt: string }) {
@@ -429,6 +436,17 @@ export function updateAdminCase(id: string, payload: Partial<CaseItem>) {
 
 export function deleteAdminCase(id: string) {
   return request<CaseItem>(`/api/admin/cases/${id}`, { method: 'DELETE' });
+}
+
+export function listAdminCaseComments(id: string) {
+  return request<{ items: CaseComment[] }>(`/api/admin/cases/${id}/comments`);
+}
+
+export function setAdminCaseLikeCount(id: string, likeCount: number) {
+  return request<CaseItem>(`/api/admin/cases/${id}/likes`, {
+    method: 'PUT',
+    body: JSON.stringify({ like_count: likeCount }),
+  });
 }
 
 export function createAdminComment(payload: {

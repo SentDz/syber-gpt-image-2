@@ -6,6 +6,7 @@ import History from './pages/History';
 import Config from './pages/Config';
 import Account from './pages/Account';
 import Billing from './pages/Billing';
+import CaseAdmin from './pages/CaseAdmin';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import AnnouncementModal from './components/AnnouncementModal';
@@ -31,6 +32,12 @@ export default function App() {
           <>
             <SideNavBar />
             <Config />
+          </>
+        } />
+        <Route path="/case-admin" element={
+          <>
+            <SideNavBar />
+            <CaseAdmin />
           </>
         } />
         <Route path="/account" element={

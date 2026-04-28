@@ -75,6 +75,20 @@ class FlakyProvider(FakeProvider):
         return await super().generate_image(config, payload)
 
 
+class FailingEditProvider(FakeProvider):
+    async def edit_image(
+        self,
+        config: dict[str, Any],
+        fields: dict[str, Any],
+        images: list[tuple[str, bytes, str]],
+        mask: tuple[str, bytes, str] | None = None,
+    ) -> dict[str, Any]:
+        self.edited_configs.append(dict(config))
+        self.edited_fields.append(fields)
+        self.edited_images.append(images)
+        raise ProviderError(500, "edit failed", {"error": {"message": "edit failed"}})
+
+
 class FakeAuthClient:
     def __init__(self) -> None:
         self.public_settings_base_urls: list[str] = []
@@ -284,7 +298,7 @@ def test_deleting_history_removes_finished_task_from_task_center(tmp_path: Path)
         assert client.get(f"/api/tasks/{task_id}").status_code == 404
 
 
-def test_deleting_history_keeps_file_referenced_by_admin_case(tmp_path: Path) -> None:
+def test_deleting_history_removes_file_and_linked_admin_case(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         client.put("/api/config", json={"api_key": "sk-test-123456"})
         generated = client.post("/api/images/generate", json={"prompt": "shared public asset"})
@@ -312,9 +326,41 @@ def test_deleting_history_keeps_file_referenced_by_admin_case(tmp_path: Path) ->
 
         assert deleted.status_code == 200
         assert deleted.json()["candidate_files"] == 1
-        assert deleted.json()["protected_files"] == 1
-        assert deleted.json()["deleted_files"] == 0
+        assert deleted.json()["protected_files"] == 0
+        assert deleted.json()["deleted_linked_cases"] == 1
+        assert deleted.json()["deleted_files"] == 1
+        assert not image_path.exists()
+        assert client.get("/api/cases?q=keep%20this%20asset").json()["items"] == []
+
+
+def test_admin_deleting_manual_case_removes_local_file(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        image_path = tmp_path / "storage" / "images" / "manual-case.png"
+        image_path.write_bytes(b"manual-case")
+        created = client.post(
+            "/api/admin/cases",
+            json={
+                "title": "Manual Local Case",
+                "prompt": "delete local case",
+                "image_url": "/storage/images/manual-case.png",
+                "image_path": str(image_path),
+                "status": "visible",
+            },
+        )
+        assert created.status_code == 200
         assert image_path.exists()
+
+        deleted = client.delete(f"/api/admin/cases/{created.json()['id']}")
+
+        assert deleted.status_code == 200
+        assert deleted.json()["status"] == "deleted"
+        assert deleted.json()["candidate_files"] == 1
+        assert deleted.json()["protected_files"] == 0
+        assert deleted.json()["deleted_files"] == 1
+        assert not image_path.exists()
 
 
 def test_admin_cleanup_expires_unpublished_history_but_keeps_public_cases(tmp_path: Path) -> None:
@@ -508,11 +554,37 @@ def test_edit_persists_upload_and_result(tmp_path: Path) -> None:
         item = task["items"][0]
         provider = client.app.state.provider
         assert item["mode"] == "edit"
-        assert item["input_image_url"].startswith("/storage/uploads/")
-        assert Path(item["input_image_path"]).exists()
+        assert item["input_image_url"] is None
+        assert item["input_image_path"] is None
+        assert list((tmp_path / "storage" / "uploads").iterdir()) == []
+        stored_task = client.app.state.db.get_image_task_by_id(response.json()["id"])
+        assert stored_task is not None
+        assert stored_task["input_image_url"] is None
+        assert stored_task["input_image_path"] is None
+        assert all("path" not in upload for upload in stored_task["request"]["uploads"])
         assert len(provider.edited_images[-1]) == 2
         assert provider.edited_images[-1][0][0] == "source.png"
         assert provider.edited_images[-1][1][0] == "style.png"
+
+
+def test_edit_deletes_reference_uploads_after_failure(tmp_path: Path) -> None:
+    with make_client(tmp_path, provider=FailingEditProvider()) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+
+        response = client.post(
+            "/api/images/edit",
+            data={"prompt": "make it fail"},
+            files=[("image", ("source.png", b"fake-image", "image/png"))],
+        )
+
+        assert response.status_code == 200
+        task = wait_for_task(client, response.json()["id"])
+        assert task["status"] == "failed"
+        item = task["items"][0]
+        assert item["status"] == "failed"
+        assert item["input_image_url"] is None
+        assert item["input_image_path"] is None
+        assert list((tmp_path / "storage" / "uploads").iterdir()) == []
 
 
 def test_account_includes_balance_and_stats(tmp_path: Path) -> None:
@@ -675,7 +747,7 @@ def test_site_settings_default_to_chinese(tmp_path: Path) -> None:
         assert data["default_locale"] == "zh-CN"
         assert data["announcement"]["enabled"] is True
         assert "即刻" in data["announcement"]["title"]
-        assert "https://ai.get-money.locker" in data["announcement"]["body"]
+        assert "https://geekai.live/purchase" in data["announcement"]["body"]
         assert "inspiration_sources" not in data
 
 
@@ -712,6 +784,7 @@ https://ai.get-money.locker
         assert "即刻" in data["announcement"]["title"]
         assert "JokoAI" not in data["announcement"]["body"]
         assert "joko" not in data["announcement"]["body"].lower()
+        assert "https://geekai.live/purchase" in data["announcement"]["body"]
 
 
 def test_site_settings_migrates_jike_default_contact(tmp_path: Path) -> None:
@@ -743,6 +816,7 @@ https://ai.get-money.locker
         assert response.status_code == 200
         data = response.json()
         assert "joko" not in data["announcement"]["body"].lower()
+        assert "https://geekai.live/purchase" in data["announcement"]["body"]
 
 
 def test_admin_can_update_site_settings(tmp_path: Path) -> None:
@@ -992,8 +1066,23 @@ def test_admin_can_manage_cases_likes_and_comments(tmp_path: Path) -> None:
         assert updated_case.json()["status"] == "hidden"
         assert client.get("/api/cases?q=manual").json()["items"] == []
 
-        admin_cases = client.get("/api/admin/cases?q=hidden").json()["items"]
-        assert admin_cases[0]["id"] == case["id"]
+        admin_result = client.get("/api/admin/cases?q=hidden&limit=5&offset=0").json()
+        assert admin_result["total"] == 1
+        assert admin_result["limit"] == 5
+        assert admin_result["offset"] == 0
+        assert admin_result["items"][0]["id"] == case["id"]
+
+        case_comments = client.get(f"/api/admin/cases/{case['id']}/comments")
+        assert case_comments.status_code == 200
+        assert {item["body"]: item["author"] for item in case_comments.json()["items"]} == {
+            "edited public case": "demo-user",
+            "admin note": "moderator",
+        }
+
+        updated_likes = client.put(f"/api/admin/cases/{case['id']}/likes", json={"like_count": 7})
+        assert updated_likes.status_code == 200
+        assert updated_likes.json()["like_count"] == 7
+        assert client.get("/api/admin/cases?q=hidden").json()["items"][0]["like_count"] == 7
 
         deleted = client.delete(f"/api/admin/cases/{case['id']}")
         assert deleted.status_code == 200
@@ -1065,12 +1154,21 @@ def test_public_comment_authors_are_masked(tmp_path: Path) -> None:
             "/api/admin/cases",
             json={
                 "title": "Privacy Case",
+                "author": "privacy@example.com",
                 "prompt": "show a privacy case",
                 "image_url": "https://example.com/privacy.jpg",
                 "status": "visible",
             },
         )
         case_id = created.json()["id"]
+        assert created.json()["author"] == "privacy@example.com"
+
+        public_cases = client.get("/api/cases?q=privacy").json()["items"]
+        assert public_cases[0]["author"] == "pr***cy@e***e.com"
+        public_case_detail = client.get(f"/api/cases/{case_id}").json()
+        assert public_case_detail["author"] == "pr***cy@e***e.com"
+        admin_cases = client.get("/api/admin/cases?q=privacy").json()["items"]
+        assert admin_cases[0]["author"] == "privacy@example.com"
 
         admin_comment = client.post(
             "/api/admin/comments",
