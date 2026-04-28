@@ -245,6 +245,8 @@ docker compose logs --tail=100 backend web
 | `IMAGE_PRICE_1K_USD` | `0.134` | 1K 本地估算价格 |
 | `IMAGE_PRICE_2K_USD` | `0.201` | 2K 本地估算价格 |
 | `IMAGE_PRICE_4K_USD` | `0.268` | 4K 本地估算价格 |
+| `IMAGE_RETENTION_DAYS` | `2` | 普通历史图片默认保留天数；已公开案例不清理 |
+| `IMAGE_CLEANUP_INTERVAL_SECONDS` | `21600` | 后台图片清理间隔，默认 6 小时 |
 
 说明：
 
@@ -278,20 +280,9 @@ Docker Compose 默认挂载：
 | `SESSION_TTL_SECONDS` | `2592000` | 登录会话有效期，默认 30 天 |
 | `GUEST_TTL_SECONDS` | `31536000` | 游客身份有效期，默认 365 天 |
 
-### 案例源同步
+### 案例库
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `INSPIRATION_SOURCE_URLS` | 两个默认 GitHub 案例源 | 案例源列表，逗号分隔 |
-| `INSPIRATION_SYNC_INTERVAL_SECONDS` | `21600` | 自动同步间隔，默认 6 小时 |
-| `INSPIRATION_SYNC_ON_STARTUP` | `true` | 启动时是否同步案例 |
-
-默认案例源：
-
-```text
-https://raw.githubusercontent.com/EvoLinkAI/awesome-gpt-image-2-prompts/main/README.md
-https://raw.githubusercontent.com/YouMind-OpenLab/awesome-gpt-image-2/main/README.md
-```
+案例库不再从外部 GitHub 源同步。用户只能公开自己的成功生图记录；管理员可以在后台手动新增、编辑、隐藏或删除案例，并管理评论。
 
 管理员也可以在系统设置里配置案例源，一行一个。
 

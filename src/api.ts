@@ -13,6 +13,18 @@ export type ViewerInfo = {
   } | null;
 };
 
+export type AuthKeyGroup = {
+  id: string;
+  name: string;
+  platform: string;
+};
+
+export type AuthKeyGroupsResult = {
+  items: AuthKeyGroup[];
+  selected_group_id: string;
+  create_group_url: string;
+};
+
 export type AppConfig = {
   owner_id: string;
   model: string;
@@ -46,6 +58,7 @@ export type HistoryItem = {
   provider_response: Record<string, unknown> | null;
   error: string | null;
   published: boolean;
+  published_case_id: string | null;
   published_inspiration_id: string | null;
   published_at: string | null;
   created_at: string;
@@ -71,31 +84,60 @@ export type ImageTask = {
   completed_at: string | null;
 };
 
-export type InspirationItem = {
+export type CaseItem = {
   id: string;
-  source_url: string;
-  source_item_id: string;
-  section: string;
+  owner_id: string;
+  history_id: string | null;
   title: string;
   author: string | null;
   prompt: string;
   image_url: string | null;
-  source_link: string | null;
-  synced_at: string;
+  image_path: string | null;
+  model: string;
+  size: string;
+  aspect_ratio: string;
+  quality: string;
+  status: 'visible' | 'hidden' | 'deleted';
+  source_type: 'user_history' | 'admin_manual';
+  created_by_admin: boolean;
+  like_count: number;
+  comment_count: number;
+  liked: boolean;
   created_at: string;
   updated_at: string;
 };
 
-export type InspirationStats = {
+export type CaseComment = {
+  id: string;
+  case_id: string;
+  owner_id: string;
+  author: string | null;
+  body: string;
+  status: 'visible' | 'hidden' | 'deleted';
+  case_title?: string;
+  can_edit: boolean;
+  can_delete: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CaseStats = {
   total: number;
-  last_synced_at: string | null;
-  sections: number;
-  section_counts: { section: string; count: number }[];
-  source_url: string;
-  source_urls: string[];
-  source_counts: { source_url: string; count: number; last_synced_at: string | null }[];
-  sync_interval_seconds: number;
-  last_error: string | null;
+  user_cases: number;
+  admin_cases: number;
+  likes: number;
+  comments: number;
+  last_case_at: string | null;
+};
+
+export type CaseSort = 'latest' | 'likes' | 'comments';
+
+export type CaseListResponse = {
+  items: CaseItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  sort: CaseSort;
 };
 
 export type BalanceInfo = {
@@ -170,12 +212,14 @@ export type SiteSettings = {
     body: string;
     updated_at: string | null;
   };
-  inspiration_sources: string[];
   upstream?: {
     provider_base_url: string;
     auth_base_url: string;
     effective_provider_base_url: string;
     effective_auth_base_url: string;
+  };
+  image_retention: {
+    days: number;
   };
   viewer: {
     authenticated: boolean;
@@ -222,7 +266,6 @@ export function updateSiteSettings(payload: {
   announcement_enabled?: boolean;
   announcement_title?: string;
   announcement_body?: string;
-  inspiration_sources?: string[];
   provider_base_url?: string;
   auth_base_url?: string;
 }) {
@@ -278,6 +321,17 @@ export function logoutAccount() {
   });
 }
 
+export function getAuthKeyGroups() {
+  return request<AuthKeyGroupsResult>('/api/auth/key-groups');
+}
+
+export function selectAuthKeyGroup(groupId: string) {
+  return request<{ ok: boolean; group: AuthKeyGroup; config: AppConfig }>('/api/auth/key-groups/select', {
+    method: 'POST',
+    body: JSON.stringify({ group_id: groupId }),
+  });
+}
+
 export function getConfig() {
   return request<AppConfig>('/api/config');
 }
@@ -314,32 +368,84 @@ export function getHistory(params: { limit?: number; offset?: number; q?: string
   return request<{ items: HistoryItem[] }>(`/api/history${query ? `?${query}` : ''}`);
 }
 
-export function getInspirations(params: { limit?: number; offset?: number; q?: string; section?: string } = {}) {
+export function getCases(params: { limit?: number; offset?: number; q?: string; sort?: CaseSort } = {}) {
   const search = new URLSearchParams();
   if (params.limit) search.set('limit', String(params.limit));
   if (params.offset) search.set('offset', String(params.offset));
   if (params.q) search.set('q', params.q);
-  if (params.section) search.set('section', params.section);
+  if (params.sort) search.set('sort', params.sort);
   const query = search.toString();
-  return request<{ items: InspirationItem[] }>(`/api/inspirations${query ? `?${query}` : ''}`);
+  return request<CaseListResponse>(`/api/cases${query ? `?${query}` : ''}`);
 }
 
-export function getInspirationStats() {
-  return request<InspirationStats>('/api/inspirations/stats');
+export function getCaseStats() {
+  return request<CaseStats>('/api/cases/stats');
 }
 
-export function syncInspirations() {
-  return request<{
-    ok: boolean;
-    parsed: number;
-    count: number;
-    cached_images: number;
-    synced_at: string;
-    source_urls: string[];
-    image_cache_errors: { url: string; error: string }[];
-  }>('/api/inspirations/sync', {
-    method: 'POST',
-  });
+export function getCase(id: string) {
+  return request<CaseItem>(`/api/cases/${id}`);
+}
+
+export function likeCase(id: string) {
+  return request<CaseItem>(`/api/cases/${id}/like`, { method: 'POST', body: JSON.stringify({}) });
+}
+
+export function unlikeCase(id: string) {
+  return request<CaseItem>(`/api/cases/${id}/like`, { method: 'DELETE' });
+}
+
+export function getCaseComments(id: string) {
+  return request<{ items: CaseComment[] }>(`/api/cases/${id}/comments`);
+}
+
+export function createCaseComment(id: string, body: string) {
+  return request<CaseComment>(`/api/cases/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+}
+
+export function updateCaseComment(id: string, payload: { body?: string; status?: 'visible' | 'hidden' | 'deleted' }) {
+  return request<CaseComment>(`/api/comments/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+}
+
+export function deleteCaseComment(id: string) {
+  return request<CaseComment>(`/api/comments/${id}`, { method: 'DELETE' });
+}
+
+export function listAdminCases(params: { limit?: number; offset?: number; q?: string } = {}) {
+  const search = new URLSearchParams();
+  if (params.limit) search.set('limit', String(params.limit));
+  if (params.offset) search.set('offset', String(params.offset));
+  if (params.q) search.set('q', params.q);
+  const query = search.toString();
+  return request<{ items: CaseItem[] }>(`/api/admin/cases${query ? `?${query}` : ''}`);
+}
+
+export function createAdminCase(payload: Partial<CaseItem> & { title: string; prompt: string }) {
+  return request<CaseItem>('/api/admin/cases', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+export function updateAdminCase(id: string, payload: Partial<CaseItem>) {
+  return request<CaseItem>(`/api/admin/cases/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+}
+
+export function deleteAdminCase(id: string) {
+  return request<CaseItem>(`/api/admin/cases/${id}`, { method: 'DELETE' });
+}
+
+export function createAdminComment(payload: {
+  case_id: string;
+  body: string;
+  author?: string;
+  status?: 'visible' | 'hidden' | 'deleted';
+}) {
+  return request<CaseComment>('/api/admin/comments', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+export function listAdminComments(params: { limit?: number; offset?: number } = {}) {
+  const search = new URLSearchParams();
+  if (params.limit) search.set('limit', String(params.limit));
+  if (params.offset) search.set('offset', String(params.offset));
+  const query = search.toString();
+  return request<{ items: CaseComment[] }>(`/api/admin/comments${query ? `?${query}` : ''}`);
 }
 
 export function deleteHistory(id: string) {
@@ -347,7 +453,7 @@ export function deleteHistory(id: string) {
 }
 
 export function publishHistory(id: string) {
-  return request<{ ok: boolean; item: HistoryItem; inspiration: InspirationItem }>(`/api/history/${id}/publish`, {
+  return request<{ ok: boolean; item: HistoryItem; case: CaseItem }>(`/api/history/${id}/publish`, {
     method: 'POST',
   });
 }

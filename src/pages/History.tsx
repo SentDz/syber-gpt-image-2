@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Search, Filter, Download, Trash2, RefreshCw, ArrowDown, Loader2, Maximize2, Globe2 } from 'lucide-react';
+import { Search, Filter, Download, Trash2, RefreshCw, ArrowDown, Loader2, Maximize2, Globe2, AlertTriangle } from 'lucide-react';
 import { deleteHistory, formatDate, generateImage, getHistory, HistoryItem, publishHistory, unpublishHistory } from '../api';
 import { useAuth } from '../auth';
 import ImagePreviewModal from '../components/ImagePreviewModal';
@@ -38,13 +38,15 @@ const getColorClasses = (colorMode: string) => {
 
 export default function History() {
   const { viewer } = useAuth();
-  const { t } = useSite();
-  const { addTask, openDrawer, taskHistoryItems } = useTasks();
+  const { siteSettings, t } = useSite();
+  const { addTask, openDrawer, removeHistoryItem, taskHistoryItems } = useTasks();
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [removedIds, setRemovedIds] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [offset, setOffset] = useState(0);
   const [previewItem, setPreviewItem] = useState<HistoryItem | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<HistoryItem | null>(null);
+  const [deletingId, setDeletingId] = useState('');
   const [publishingIds, setPublishingIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -70,10 +72,25 @@ export default function History() {
     load(0, false);
   }, [viewer?.owner_id]);
 
-  async function handleDelete(id: string) {
-    await deleteHistory(id);
-    setItems((current) => current.filter((item) => item.id !== id));
-    setRemovedIds((current) => (current.includes(id) ? current : [...current, id]));
+  async function handleConfirmDelete() {
+    if (!deleteCandidate) {
+      return;
+    }
+    const id = deleteCandidate.id;
+    setDeletingId(id);
+    setError('');
+    try {
+      await deleteHistory(id);
+      removeHistoryItem(id);
+      setItems((current) => current.filter((item) => item.id !== id));
+      setRemovedIds((current) => (current.includes(id) ? current : [...current, id]));
+      setPreviewItem((current) => (current?.id === id ? null : current));
+      setDeleteCandidate(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingId('');
+    }
   }
 
   async function handleRegenerate(item: HistoryItem) {
@@ -122,6 +139,7 @@ export default function History() {
   }
 
   const visibleItems = mergeHistory([...taskHistoryItems, ...items]).filter((item) => !removedIds.includes(item.id));
+  const retentionDays = siteSettings?.image_retention.days || 2;
 
   return (
     <div className="md:ml-64 px-6 md:px-12 py-8 max-w-[1440px] mx-auto min-h-screen pt-24 pb-12 bg-[radial-gradient(ellipse_at_top,var(--color-surface-container-high),var(--color-background))] font-mono">
@@ -132,6 +150,7 @@ export default function History() {
            </div>
           <h1 className="text-4xl md:text-5xl text-on-surface font-bold tracking-tighter">{t('history_title')}</h1>
           <p className="text-white/50 text-sm">{t('history_subtitle')}</p>
+          <p className="text-white/35 text-xs">{t('history_retention_notice', { days: retentionDays })}</p>
         </div>
 
         <div className="flex gap-4 w-full md:w-auto">
@@ -226,7 +245,7 @@ export default function History() {
                   <Download size={14} />
                 </a>
                 <button
-                  onClick={() => handleDelete(item.id)}
+                  onClick={() => setDeleteCandidate(item)}
                   className="flex h-10 items-center justify-center border border-error/20 bg-error/5 text-error transition-all hover:bg-error/20"
                   title={t('history_delete')}
                   type="button"
@@ -265,6 +284,49 @@ export default function History() {
         subtitle={previewItem?.prompt}
         onClose={() => setPreviewItem(null)}
       />
+      {deleteCandidate ? (
+        <div
+          className="fixed inset-0 z-[190] flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm"
+          onClick={() => {
+            if (!deletingId) {
+              setDeleteCandidate(null);
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-md border border-error/30 bg-surface-container-high shadow-[0_0_40px_rgba(255,64,129,0.16)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="border-b border-white/10 px-5 py-4">
+              <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-error">
+                <AlertTriangle size={15} />
+                {t('history_delete_confirm_title')}
+              </div>
+              <p className="text-sm leading-6 text-white/70">{t('history_delete_confirm_body')}</p>
+              <p className="mt-3 line-clamp-2 text-xs text-white/45">{deleteCandidate.prompt}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3 px-5 py-4">
+              <button
+                className="flex h-11 items-center justify-center border border-white/15 bg-white/5 text-xs font-bold uppercase tracking-widest text-white/70 transition-colors hover:border-white/30 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                type="button"
+                onClick={() => setDeleteCandidate(null)}
+                disabled={Boolean(deletingId)}
+              >
+                {t('history_delete_confirm_cancel')}
+              </button>
+              <button
+                className="flex h-11 items-center justify-center gap-2 border border-error/40 bg-error/10 text-xs font-bold uppercase tracking-widest text-error transition-colors hover:bg-error/20 disabled:cursor-not-allowed disabled:opacity-50"
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={Boolean(deletingId)}
+              >
+                {deletingId ? <Loader2 className="animate-spin" size={14} /> : <Trash2 size={14} />}
+                {t('history_delete_confirm_action')}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

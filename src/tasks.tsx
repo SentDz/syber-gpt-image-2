@@ -22,12 +22,13 @@ type TaskCenterValue = {
   closeDrawer: () => void;
   toggleDrawer: () => void;
   addTask: (task: ImageTask) => void;
+  removeHistoryItem: (historyId: string) => void;
   refreshTasks: () => Promise<void>;
   dismissToast: (toastId: string) => void;
 };
 
 const TASK_FETCH_LIMIT = 20;
-const TASK_POLL_INTERVAL_MS = 1500;
+const TASK_POLL_INTERVAL_MS = 5000;
 
 const TaskCenterContext = createContext<TaskCenterValue | null>(null);
 
@@ -54,6 +55,10 @@ function mergeHistoryItems(items: HistoryItem[]) {
   return [...merged.values()].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 }
 
+function isCompletedTask(task: ImageTask): task is ImageTask & { status: TaskToast['status'] } {
+  return task.status === 'succeeded' || task.status === 'failed';
+}
+
 export function TaskCenterProvider({ children }: { children: ReactNode }) {
   const { viewer } = useAuth();
   const [tasks, setTasks] = useState<ImageTask[]>([]);
@@ -67,14 +72,13 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
 
   const notifyCompletedTasks = useCallback((previous: ImageTask[], next: ImageTask[]) => {
     const previousById = new Map(previous.map((task) => [task.id, task]));
-    const completed = next.filter((task) => {
+    const completed = next.filter((task): task is ImageTask & { status: TaskToast['status'] } => {
       const previousTask = previousById.get(task.id);
       if (!previousTask) {
         return false;
       }
       const wasActive = previousTask.status === 'queued' || previousTask.status === 'running';
-      const isTerminal = task.status === 'succeeded' || task.status === 'failed';
-      return wasActive && isTerminal;
+      return wasActive && isCompletedTask(task);
     });
     if (completed.length === 0) {
       return;
@@ -116,7 +120,7 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
     const merged = mergeTasks(tasksRef.current, [task]);
     tasksRef.current = merged;
     setTasks(merged);
-    if (task.status === 'succeeded' || task.status === 'failed') {
+    if (isCompletedTask(task)) {
       setToasts((current) => [
         {
           id: `${task.id}:${task.status}:${task.updated_at}`,
@@ -130,6 +134,36 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
       ].slice(0, 6));
     }
     setDrawerOpen(true);
+  }, []);
+
+  const removeHistoryItem = useCallback((historyId: string) => {
+    const changedTaskIds = new Set<string>();
+    const removedTaskIds = new Set<string>();
+    const nextTasks = sortTasks(
+      tasksRef.current
+        .map((task) => {
+          const currentItems = task.items || [];
+          const nextItems = currentItems.filter((item) => item.id !== historyId);
+          if (nextItems.length === currentItems.length) {
+            return task;
+          }
+          changedTaskIds.add(task.id);
+          return { ...task, items: nextItems };
+        })
+        .filter((task) => {
+          const completed = task.status === 'succeeded' || task.status === 'failed';
+          const shouldRemove = changedTaskIds.has(task.id) && completed && (task.items || []).length === 0;
+          if (shouldRemove) {
+            removedTaskIds.add(task.id);
+          }
+          return !shouldRemove;
+        }),
+    );
+    tasksRef.current = nextTasks;
+    setTasks(nextTasks);
+    if (removedTaskIds.size > 0) {
+      setToasts((current) => current.filter((toast) => !removedTaskIds.has(toast.taskId)));
+    }
   }, []);
 
   const activeTaskIds = useMemo(
@@ -175,7 +209,7 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    timer = window.setTimeout(poll, 500);
+    timer = window.setTimeout(poll, TASK_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -214,10 +248,11 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
       closeDrawer: () => setDrawerOpen(false),
       toggleDrawer: () => setDrawerOpen((current) => !current),
       addTask,
+      removeHistoryItem,
       refreshTasks,
       dismissToast,
     }),
-    [activeTaskIds.length, addTask, dismissToast, drawerOpen, refreshTasks, taskHistoryItems, tasks, toasts],
+    [activeTaskIds.length, addTask, dismissToast, drawerOpen, refreshTasks, removeHistoryItem, taskHistoryItems, tasks, toasts],
   );
 
   return <TaskCenterContext.Provider value={value}>{children}</TaskCenterContext.Provider>;

@@ -59,7 +59,7 @@ class OpenAICompatibleImageClient:
     ) -> httpx.Response:
         api_key = (config.get("api_key") or "").strip()
         if not api_key:
-            raise ProviderError(400, "请先在配置页保存 JokoAI API Key")
+            raise ProviderError(400, "请先在配置页保存 即刻 API Key")
 
         url = _join_absolute_path(config["base_url"], path) if absolute_path else _join_base(config["base_url"], path)
         headers = kwargs.pop("headers", {})

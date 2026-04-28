@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -138,7 +139,7 @@ class FakeAuthClient:
         return []
 
     async def list_available_groups(self, base_url: str, access_token: str) -> list[dict[str, Any]]:
-        raise AssertionError("Direct Sub2API mode should not require a dedicated image group")
+        return [{"id": 42, "name": "image-openai", "platform": "openai"}]
 
     async def create_key(self, base_url: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.create_key_base_urls.append(base_url)
@@ -155,6 +156,20 @@ class FakeAuthClient:
     async def list_usage(self, base_url: str, access_token: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.list_usage_base_urls.append(base_url)
         return list(self.usage_logs)
+
+
+class ExistingKeysAuthClient(FakeAuthClient):
+    def __init__(self, keys: list[dict[str, Any]], groups: list[dict[str, Any]] | None = None) -> None:
+        super().__init__()
+        self.keys = keys
+        self.groups = groups or [{"id": 42, "name": "image-openai", "platform": "openai"}]
+
+    async def list_keys(self, base_url: str, access_token: str) -> list[dict[str, Any]]:
+        self.list_keys_base_urls.append(base_url)
+        return list(self.keys)
+
+    async def list_available_groups(self, base_url: str, access_token: str) -> list[dict[str, Any]]:
+        return list(self.groups)
 
 
 def make_app(tmp_path: Path, auth_client: FakeAuthClient | None = None, provider: FakeProvider | None = None):
@@ -174,14 +189,13 @@ def make_app(tmp_path: Path, auth_client: FakeAuthClient | None = None, provider
         user_name="tester",
         cors_origins=["http://127.0.0.1:3000"],
         request_timeout_seconds=10,
-        inspiration_source_url="https://example.com/README.md",
-        inspiration_sync_interval_seconds=0,
-        inspiration_sync_on_startup=False,
         session_cookie_name="cybergen_session",
         guest_cookie_name="cybergen_guest",
         session_ttl_seconds=3600,
         guest_ttl_seconds=86400,
         cookie_secure=False,
+        image_retention_days=2,
+        image_cleanup_interval_seconds=6 * 60 * 60,
     )
     app = create_app(settings=settings, provider=provider or FakeProvider(), auth_client=auth_client or FakeAuthClient())
     app.dependency_overrides[_db] = lambda: app.state.db
@@ -244,6 +258,114 @@ def test_guest_history_is_isolated_by_cookie(tmp_path: Path) -> None:
         assert history_a[0]["prompt"] == "neon city"
         assert history_b == []
         assert config_b["api_key_set"] is False
+
+
+def test_deleting_history_removes_finished_task_from_task_center(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    with TestClient(app) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+        generated = client.post("/api/images/generate", json={"prompt": "delete me"})
+        assert generated.status_code == 200
+        task_id = generated.json()["id"]
+        task = wait_for_task(client, task_id)
+        history_id = task["items"][0]["id"]
+        image_path = Path(task["items"][0]["image_path"])
+        assert image_path.exists()
+
+        deleted = client.delete(f"/api/history/{history_id}")
+
+        assert deleted.status_code == 200
+        assert deleted.json()["candidate_files"] == 1
+        assert deleted.json()["protected_files"] == 0
+        assert deleted.json()["deleted_files"] == 1
+        assert not image_path.exists()
+        assert client.get("/api/history").json()["items"] == []
+        assert client.get("/api/tasks").json()["items"] == []
+        assert client.get(f"/api/tasks/{task_id}").status_code == 404
+
+
+def test_deleting_history_keeps_file_referenced_by_admin_case(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+        generated = client.post("/api/images/generate", json={"prompt": "shared public asset"})
+        assert generated.status_code == 200
+        task = wait_for_task(client, generated.json()["id"])
+        history_item = task["items"][0]
+        image_path = Path(history_item["image_path"])
+        assert image_path.exists()
+
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+        admin_case = client.post(
+            "/api/admin/cases",
+            json={
+                "title": "Shared Asset",
+                "prompt": "keep this asset",
+                "image_url": history_item["image_url"],
+                "image_path": history_item["image_path"],
+                "status": "visible",
+            },
+        )
+        assert admin_case.status_code == 200
+
+        deleted = client.delete(f"/api/history/{history_item['id']}")
+
+        assert deleted.status_code == 200
+        assert deleted.json()["candidate_files"] == 1
+        assert deleted.json()["protected_files"] == 1
+        assert deleted.json()["deleted_files"] == 0
+        assert image_path.exists()
+
+
+def test_admin_cleanup_expires_unpublished_history_but_keeps_public_cases(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        client.put("/api/config", json={"api_key": "sk-test-123456"})
+        unpublished_task = client.post("/api/images/generate", json={"prompt": "temporary history"})
+        public_task = client.post("/api/images/generate", json={"prompt": "public keeper"})
+        assert unpublished_task.status_code == 200
+        assert public_task.status_code == 200
+        wait_for_task(client, unpublished_task.json()["id"])
+        wait_for_task(client, public_task.json()["id"])
+
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+        history_items = client.get("/api/history").json()["items"]
+        by_prompt = {item["prompt"]: item for item in history_items}
+        unpublished = by_prompt["temporary history"]
+        public = by_prompt["public keeper"]
+        unpublished_path = Path(unpublished["image_path"])
+        public_path = Path(public["image_path"])
+        assert unpublished_path.exists()
+        assert public_path.exists()
+
+        old_timestamp = (datetime.now(timezone.utc) - timedelta(days=3)).replace(microsecond=0).isoformat()
+        with client.app.state.db.connect() as conn:
+            conn.execute(
+                "UPDATE image_history SET created_at = ?, updated_at = ?",
+                (old_timestamp, old_timestamp),
+            )
+
+        published = client.post(f"/api/history/{public['id']}/publish")
+        assert published.status_code == 200
+
+        cleanup = client.post("/api/admin/maintenance/cleanup-images")
+
+        assert cleanup.status_code == 200
+        data = cleanup.json()
+        assert data["retention_days"] == 2
+        assert data["deleted_history"] == 1
+        assert data["protected_history"] == 1
+        assert data["deleted_tasks"] == 1
+        assert data["deleted_files"] == 1
+        assert not unpublished_path.exists()
+        assert public_path.exists()
+        remaining_history = client.get("/api/history").json()["items"]
+        assert [item["id"] for item in remaining_history] == [public["id"]]
+        remaining_tasks = client.get("/api/tasks").json()["items"]
+        assert all(unpublished["id"] not in [item["id"] for item in task["items"]] for task in remaining_tasks)
+        public_cases = client.get("/api/cases?q=public%20keeper").json()["items"]
+        assert len(public_cases) == 1
+        assert public_cases[0]["history_id"] == public["id"]
 
 
 def test_generation_passes_resolution_ratio_and_quality(tmp_path: Path) -> None:
@@ -418,46 +540,51 @@ def test_user_can_publish_and_unpublish_history_as_public_case(tmp_path: Path) -
         history_before = client.get("/api/history").json()["items"][0]
         assert history_before["published"] is False
 
+        guest_publish = client.post(f"/api/history/{history_id}/publish")
+        assert guest_publish.status_code == 401
+
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
         published = client.post(f"/api/history/{history_id}/publish")
         assert published.status_code == 200
         published_data = published.json()
         assert published_data["item"]["published"] is True
-        assert published_data["inspiration"]["section"] == "用户作品"
-        assert published_data["inspiration"]["prompt"] == "public neon gallery"
+        assert published_data["case"]["source_type"] == "user_history"
+        assert published_data["case"]["prompt"] == "public neon gallery"
+        assert published_data["item"]["published_case_id"] == published_data["case"]["id"]
 
-        public_cases = client.get("/api/inspirations?q=public%20neon").json()["items"]
+        public_cases = client.get("/api/cases?q=public%20neon").json()["items"]
         assert len(public_cases) == 1
-        assert public_cases[0]["source_url"] == "joko-image://user-gallery"
+        assert public_cases[0]["source_type"] == "user_history"
 
         unpublished = client.delete(f"/api/history/{history_id}/publish")
         assert unpublished.status_code == 200
         assert unpublished.json()["item"]["published"] is False
-        public_cases_after = client.get("/api/inspirations?q=public%20neon").json()["items"]
+        public_cases_after = client.get("/api/cases?q=public%20neon").json()["items"]
         assert public_cases_after == []
 
 
-def test_login_binds_managed_key_and_merges_guest_history(tmp_path: Path) -> None:
+def test_login_merges_guest_history_without_auto_selecting_key(tmp_path: Path) -> None:
     auth = FakeAuthClient()
     with make_client(tmp_path, auth_client=auth) as client:
         client.put("/api/config", json={"api_key": "sk-guest-123456"})
         generated = client.post("/api/images/generate", json={"prompt": "guest prompt"})
         task_id = generated.json()["id"]
+        task = wait_for_task(client, task_id)
+        assert task["status"] == "succeeded"
 
         login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
         assert login.status_code == 200
         assert login.json()["viewer"]["authenticated"] is True
-        assert auth.created_keys and auth.created_keys[0]["name"] == "cybergen-image"
-        assert auth.created_keys[0]["group"]["id"] is None
-
-        task = wait_for_task(client, task_id)
-        assert task["status"] == "succeeded"
+        assert auth.created_keys == []
 
         config = client.get("/api/config").json()
         history = client.get("/api/history").json()["items"]
         account = client.get("/api/account").json()
 
         assert config["managed_by_auth"] is True
-        assert config["api_key_hint"] == "sk-use...3456"
+        assert config["api_key_set"] is False
         assert len(history) == 1
         assert history[0]["prompt"] == "guest prompt"
         assert account["viewer"]["user"]["email"] == "demo@example.com"
@@ -465,10 +592,63 @@ def test_login_binds_managed_key_and_merges_guest_history(tmp_path: Path) -> Non
         assert account["viewer"]["user"]["role"] == "admin"
 
 
+def test_user_can_select_group_and_reuse_existing_key(tmp_path: Path) -> None:
+    auth = ExistingKeysAuthClient(
+        [
+            {
+                "id": 1,
+                "key": "sk-other-group-111111",
+                "name": "other-group",
+                "group": {"id": 10, "name": "text-only", "platform": "openai"},
+                "status": "active",
+            },
+            {
+                "id": 2,
+                "key": "sk-image-group-222222",
+                "name": "image-group",
+                "group": {"id": 42, "name": "image-openai", "platform": "openai"},
+                "status": "active",
+            },
+        ]
+    )
+
+    with make_client(tmp_path, auth_client=auth) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        groups = client.get("/api/auth/key-groups")
+        assert groups.status_code == 200
+        assert groups.json()["items"] == [{"id": "42", "name": "image-openai", "platform": "openai"}]
+
+        selected = client.post("/api/auth/key-groups/select", json={"group_id": "42"})
+        assert selected.status_code == 200
+        assert auth.created_keys == []
+        assert selected.json()["group"]["name"] == "image-openai"
+        config = client.get("/api/config").json()
+        assert config["api_key_hint"] == "sk-ima...2222"
+
+
+def test_user_group_selection_creates_key_for_selected_group(tmp_path: Path) -> None:
+    auth = ExistingKeysAuthClient([])
+
+    with make_client(tmp_path, auth_client=auth) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        selected = client.post("/api/auth/key-groups/select", json={"group_id": "42"})
+        assert selected.status_code == 200
+        assert auth.created_keys and auth.created_keys[0]["name"] == "cybergen-image"
+        assert auth.created_keys[0]["group"]["id"] == 42
+        config = client.get("/api/config").json()
+        assert config["api_key_hint"] == "sk-use...3456"
+
+
 def test_signed_in_user_can_override_key_and_clear_back_to_managed(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
         assert login.status_code == 200
+        selected = client.post("/api/auth/key-groups/select", json={"group_id": "42"})
+        assert selected.status_code == 200
 
         overridden = client.put("/api/config", json={"api_key": "sk-shared-bonus-654321"})
         assert overridden.status_code == 200
@@ -494,9 +674,75 @@ def test_site_settings_default_to_chinese(tmp_path: Path) -> None:
         data = response.json()
         assert data["default_locale"] == "zh-CN"
         assert data["announcement"]["enabled"] is True
-        assert "JokoAI" in data["announcement"]["title"]
+        assert "即刻" in data["announcement"]["title"]
         assert "https://ai.get-money.locker" in data["announcement"]["body"]
-        assert data["inspiration_sources"] == ["https://example.com/README.md"]
+        assert "inspiration_sources" not in data
+
+
+def test_site_settings_migrates_old_default_brand(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        db = client.app.state.db
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE site_settings
+                SET announcement_title = ?,
+                    announcement_body = ?
+                WHERE id = 1
+                """,
+                (
+                    "欢迎来到 JokoAI 图像系统",
+                    """欢迎使用 JokoAI 图像生态系统。
+
+站主联系方式：
+QQ：935764227
+Telegram：https://t.me/jokoacoount
+
+中转站 / 充值站点：
+https://ai.get-money.locker
+
+如需充值、额度支持或账号协助，请通过以上方式联系。""",
+                ),
+            )
+
+        response = client.get("/api/site-settings")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "即刻" in data["announcement"]["title"]
+        assert "JokoAI" not in data["announcement"]["body"]
+        assert "joko" not in data["announcement"]["body"].lower()
+
+
+def test_site_settings_migrates_jike_default_contact(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        db = client.app.state.db
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE site_settings
+                SET announcement_body = ?
+                WHERE id = 1
+                """,
+                (
+                    """欢迎使用 即刻 图像生态系统。
+
+站主联系方式：
+QQ：935764227
+Telegram：https://t.me/jokoacoount
+
+中转站 / 充值站点：
+https://ai.get-money.locker
+
+如需充值、额度支持或账号协助，请通过以上方式联系。""",
+                ),
+            )
+
+        response = client.get("/api/site-settings")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "joko" not in data["announcement"]["body"].lower()
 
 
 def test_admin_can_update_site_settings(tmp_path: Path) -> None:
@@ -511,10 +757,6 @@ def test_admin_can_update_site_settings(tmp_path: Path) -> None:
                 "announcement_enabled": True,
                 "announcement_title": "系统维护通知",
                 "announcement_body": "今晚 23:00 会进行维护。",
-                "inspiration_sources": [
-                    "https://github.com/YouMind-OpenLab/awesome-gpt-image-2",
-                    "https://raw.githubusercontent.com/EvoLinkAI/awesome-gpt-image-2-prompts/main/README.md",
-                ],
             },
         )
 
@@ -523,7 +765,7 @@ def test_admin_can_update_site_settings(tmp_path: Path) -> None:
         assert data["default_locale"] == "en-US"
         assert data["announcement"]["enabled"] is True
         assert data["announcement"]["title"] == "系统维护通知"
-        assert data["inspiration_sources"][0] == "https://raw.githubusercontent.com/YouMind-OpenLab/awesome-gpt-image-2/main/README.md"
+        assert "inspiration_sources" not in data
 
 
 def test_admin_can_update_global_upstream_settings(tmp_path: Path) -> None:
@@ -685,28 +927,157 @@ def test_cache_inspiration_images_to_local_storage(tmp_path: Path) -> None:
     assert cached_path.read_bytes() == b"png-data"
 
 
-def test_manual_inspiration_sync_endpoint(tmp_path: Path) -> None:
+def test_admin_can_manage_cases_likes_and_comments(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
-        db = client.app.state.db
-        db.upsert_inspirations(
-            "https://example.com/README.md",
-            [
-                {
-                    "id": "abc",
-                    "source_item_id": "abc",
-                    "section": "UI",
-                    "title": "Mockup",
-                    "author": "@demo",
-                    "prompt": "make a UI",
-                    "image_url": "https://example.com/image.jpg",
-                    "source_link": "https://example.com/post",
-                    "raw": {},
-                }
-            ],
+        assert client.get("/api/inspirations").status_code == 404
+        assert client.post("/api/inspirations/sync").status_code == 404
+
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        created = client.post(
+            "/api/admin/cases",
+            json={
+                "title": "Manual Mockup",
+                "author": "@admin",
+                "prompt": "make a UI case",
+                "image_url": "https://example.com/image.jpg",
+                "status": "visible",
+            },
         )
+        assert created.status_code == 200
+        case = created.json()
+        assert case["source_type"] == "admin_manual"
+        assert case["created_by_admin"] is True
 
-        response = client.get("/api/inspirations")
+        public_cases = client.get("/api/cases?q=manual").json()["items"]
+        assert len(public_cases) == 1
+        assert public_cases[0]["id"] == case["id"]
 
-        assert response.status_code == 200
-        item = response.json()["items"][0]
-        assert item["title"] == "Mockup"
+        liked = client.post(f"/api/cases/{case['id']}/like")
+        assert liked.status_code == 200
+        assert liked.json()["liked"] is True
+        assert liked.json()["like_count"] == 1
+        liked_again = client.post(f"/api/cases/{case['id']}/like")
+        assert liked_again.json()["like_count"] == 1
+
+        comment = client.post(f"/api/cases/{case['id']}/comments", json={"body": "great public case"})
+        assert comment.status_code == 200
+        comment_id = comment.json()["id"]
+        assert comment.json()["author"] == "de***er"
+        assert comment.json()["can_delete"] is True
+        detail = client.get(f"/api/cases/{case['id']}").json()
+        assert detail["comment_count"] == 1
+
+        admin_comment = client.post(
+            "/api/admin/comments",
+            json={"case_id": case["id"], "author": "moderator", "body": "admin note", "status": "hidden"},
+        )
+        assert admin_comment.status_code == 200
+        assert admin_comment.json()["status"] == "hidden"
+        assert admin_comment.json()["can_edit"] is True
+        public_comments = client.get(f"/api/cases/{case['id']}/comments").json()["items"]
+        assert [item["body"] for item in public_comments] == ["great public case"]
+        assert public_comments[0]["author"] == "de***er"
+        admin_comments = client.get("/api/admin/comments").json()["items"]
+        assert {item["body"]: item["author"] for item in admin_comments}["great public case"] == "demo-user"
+
+        updated_comment = client.put(f"/api/comments/{comment_id}", json={"body": "edited public case", "status": "hidden"})
+        assert updated_comment.status_code == 200
+        assert updated_comment.json()["body"] == "edited public case"
+        assert client.get(f"/api/cases/{case['id']}/comments").json()["items"] == []
+
+        updated_case = client.put(f"/api/admin/cases/{case['id']}", json={"title": "Hidden Mockup", "status": "hidden"})
+        assert updated_case.status_code == 200
+        assert updated_case.json()["status"] == "hidden"
+        assert client.get("/api/cases?q=manual").json()["items"] == []
+
+        admin_cases = client.get("/api/admin/cases?q=hidden").json()["items"]
+        assert admin_cases[0]["id"] == case["id"]
+
+        deleted = client.delete(f"/api/admin/cases/{case['id']}")
+        assert deleted.status_code == 200
+        assert deleted.json()["status"] == "deleted"
+
+
+def test_public_cases_support_sorting_and_pagination(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        created_cases = []
+        for title in ("Old Case", "Liked Case", "Commented Case"):
+            created = client.post(
+                "/api/admin/cases",
+                json={
+                    "title": title,
+                    "prompt": f"prompt for {title}",
+                    "image_url": f"https://example.com/{title.lower().replace(' ', '-')}.jpg",
+                    "status": "visible",
+                },
+            )
+            assert created.status_code == 200
+            created_cases.append(created.json())
+
+        timestamps = {
+            created_cases[0]["id"]: "2026-04-20T00:00:00+00:00",
+            created_cases[1]["id"]: "2026-04-21T00:00:00+00:00",
+            created_cases[2]["id"]: "2026-04-22T00:00:00+00:00",
+        }
+        with client.app.state.db.connect() as conn:
+            for case_id, timestamp in timestamps.items():
+                conn.execute(
+                    "UPDATE public_cases SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (timestamp, timestamp, case_id),
+                )
+
+        liked = client.post(f"/api/cases/{created_cases[1]['id']}/like")
+        assert liked.status_code == 200
+        commented = client.post(
+            "/api/admin/comments",
+            json={"case_id": created_cases[0]["id"], "author": "mod", "body": "visible comment", "status": "visible"},
+        )
+        assert commented.status_code == 200
+
+        latest = client.get("/api/cases?sort=latest&limit=2&offset=0")
+        likes = client.get("/api/cases?sort=likes&limit=3")
+        comments = client.get("/api/cases?sort=comments&limit=3")
+        page_two = client.get("/api/cases?sort=latest&limit=2&offset=1")
+
+        assert latest.status_code == 200
+        assert latest.json()["total"] == 3
+        assert [item["title"] for item in latest.json()["items"]] == ["Commented Case", "Liked Case"]
+        assert likes.status_code == 200
+        assert likes.json()["items"][0]["title"] == "Liked Case"
+        assert comments.status_code == 200
+        assert comments.json()["items"][0]["title"] == "Old Case"
+        assert page_two.status_code == 200
+        assert page_two.json()["offset"] == 1
+        assert [item["title"] for item in page_two.json()["items"]] == ["Liked Case", "Old Case"]
+
+
+def test_public_comment_authors_are_masked(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login = client.post("/api/auth/login", json={"email": "demo@example.com", "password": "secret123"})
+        assert login.status_code == 200
+
+        created = client.post(
+            "/api/admin/cases",
+            json={
+                "title": "Privacy Case",
+                "prompt": "show a privacy case",
+                "image_url": "https://example.com/privacy.jpg",
+                "status": "visible",
+            },
+        )
+        case_id = created.json()["id"]
+
+        admin_comment = client.post(
+            "/api/admin/comments",
+            json={"case_id": case_id, "author": "privacy@example.com", "body": "email author", "status": "visible"},
+        )
+        assert admin_comment.status_code == 200
+        assert admin_comment.json()["author"] == "privacy@example.com"
+
+        public_comments = client.get(f"/api/cases/{case_id}/comments").json()["items"]
+        assert public_comments[0]["author"] == "pr***cy@e***e.com"

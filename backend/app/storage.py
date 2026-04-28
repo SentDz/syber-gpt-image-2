@@ -4,7 +4,7 @@ import base64
 import hashlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -84,6 +84,34 @@ async def cache_remote_image(settings: Settings, image_url: str, client: httpx.A
     path = settings.inspirations_dir / filename
     path.write_bytes(response.content)
     return {"path": str(path), "url": f"/storage/inspirations/{filename}", "source_url": image_url}
+
+
+def delete_storage_files(settings: Settings, paths: Iterable[str]) -> dict[str, int]:
+    storage_root = settings.storage_dir.resolve()
+    deleted = 0
+    missing = 0
+    skipped = 0
+    errors = 0
+    for raw_path in sorted({str(path).strip() for path in paths if str(path).strip()}):
+        try:
+            path = Path(raw_path).expanduser()
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(storage_root)
+        except (OSError, ValueError):
+            skipped += 1
+            continue
+        if not resolved.exists():
+            missing += 1
+            continue
+        if not resolved.is_file():
+            skipped += 1
+            continue
+        try:
+            resolved.unlink()
+            deleted += 1
+        except OSError:
+            errors += 1
+    return {"deleted_files": deleted, "missing_files": missing, "skipped_files": skipped, "file_errors": errors}
 
 
 def _decode_base64_payload(value: str) -> tuple[str, bytes]:

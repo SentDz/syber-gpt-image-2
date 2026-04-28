@@ -15,6 +15,8 @@ services:
       IMAGE_PRICE_1K_USD: ${IMAGE_PRICE_1K_USD:-0.134}
       IMAGE_PRICE_2K_USD: ${IMAGE_PRICE_2K_USD:-0.201}
       IMAGE_PRICE_4K_USD: ${IMAGE_PRICE_4K_USD:-0.268}
+      IMAGE_RETENTION_DAYS: ${IMAGE_RETENTION_DAYS:-2}
+      IMAGE_CLEANUP_INTERVAL_SECONDS: ${IMAGE_CLEANUP_INTERVAL_SECONDS:-21600}
       DATABASE_PATH: /data/app.sqlite3
       STORAGE_DIR: /storage
       PROVIDER_TIMEOUT_SECONDS: ${PROVIDER_TIMEOUT_SECONDS:-300}
@@ -24,9 +26,6 @@ services:
       GUEST_COOKIE_NAME: ${GUEST_COOKIE_NAME:-cybergen_guest}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-2592000}
       GUEST_TTL_SECONDS: ${GUEST_TTL_SECONDS:-31536000}
-      INSPIRATION_SOURCE_URLS: ${INSPIRATION_SOURCE_URLS:-https://raw.githubusercontent.com/EvoLinkAI/awesome-gpt-image-2-prompts/main/README.md,https://raw.githubusercontent.com/YouMind-OpenLab/awesome-gpt-image-2/main/README.md}
-      INSPIRATION_SYNC_INTERVAL_SECONDS: ${INSPIRATION_SYNC_INTERVAL_SECONDS:-21600}
-      INSPIRATION_SYNC_ON_STARTUP: ${INSPIRATION_SYNC_ON_STARTUP:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

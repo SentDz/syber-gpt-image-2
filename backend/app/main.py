@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -16,10 +18,12 @@ from pydantic import BaseModel, Field
 
 from .auth_client import Sub2APIAuthClient
 from .db import Database, utc_now
-from .inspirations import normalize_inspiration_source_urls, run_inspiration_sync_loop, sync_inspirations
 from .provider import OpenAICompatibleImageClient, ProviderError
 from .settings import Settings
-from .storage import save_provider_image, save_upload
+from .storage import delete_storage_files, save_provider_image, save_upload
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigUpdate(BaseModel):
@@ -106,14 +110,59 @@ class AuthLogin2FARequest(BaseModel):
     totp_code: str = Field(min_length=6, max_length=6)
 
 
+class AuthKeyGroupSelectRequest(BaseModel):
+    group_id: str = Field(min_length=1, max_length=120)
+
+
 class SiteSettingsUpdate(BaseModel):
     default_locale: str | None = None
     announcement_enabled: bool | None = None
     announcement_title: str | None = Field(default=None, max_length=120)
     announcement_body: str | None = Field(default=None, max_length=12000)
-    inspiration_sources: list[str] | None = None
     provider_base_url: str | None = None
     auth_base_url: str | None = None
+
+
+class CaseCommentRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
+
+
+class CaseCommentUpdate(BaseModel):
+    body: str | None = Field(default=None, min_length=1, max_length=2000)
+    status: str | None = None
+
+
+class AdminCommentRequest(BaseModel):
+    case_id: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=2000)
+    author: str | None = Field(default=None, max_length=120)
+    status: str = "visible"
+
+
+class AdminCaseRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    prompt: str = Field(min_length=1, max_length=8000)
+    image_url: str | None = Field(default=None, max_length=2048)
+    image_path: str | None = Field(default=None, max_length=2048)
+    author: str | None = Field(default=None, max_length=120)
+    model: str | None = Field(default=None, max_length=120)
+    size: str | None = Field(default=None, max_length=80)
+    aspect_ratio: str | None = Field(default=None, max_length=40)
+    quality: str | None = Field(default=None, max_length=40)
+    status: str = "visible"
+
+
+class AdminCaseUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    prompt: str | None = Field(default=None, min_length=1, max_length=8000)
+    image_url: str | None = Field(default=None, max_length=2048)
+    image_path: str | None = Field(default=None, max_length=2048)
+    author: str | None = Field(default=None, max_length=120)
+    model: str | None = Field(default=None, max_length=120)
+    size: str | None = Field(default=None, max_length=80)
+    aspect_ratio: str | None = Field(default=None, max_length=40)
+    quality: str | None = Field(default=None, max_length=40)
+    status: str | None = None
 
 
 @dataclass
@@ -163,18 +212,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if settings.inspiration_sync_on_startup or settings.inspiration_sync_interval_seconds > 0:
-            app.state.inspiration_task = asyncio.create_task(run_inspiration_sync_loop(app))
+        cleanup_task = asyncio.create_task(_cleanup_expired_images_loop(app))
+        app.state.cleanup_task = cleanup_task
         try:
             yield
         finally:
-            task = app.state.inspiration_task
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
             pending_image_tasks = list(app.state.image_tasks.values())
             for image_task in pending_image_tasks:
                 image_task.cancel()
@@ -189,10 +236,7 @@ def create_app(
     app.state.db = db
     app.state.provider = provider or OpenAICompatibleImageClient(settings.request_timeout_seconds)
     app.state.auth_client = auth_client or Sub2APIAuthClient(settings.request_timeout_seconds)
-    app.state.inspiration_task = None
     app.state.image_tasks = {}
-    app.state.last_inspiration_sync = None
-    app.state.last_inspiration_sync_error = None
     app.dependency_overrides[_db] = lambda: app.state.db
     app.dependency_overrides[_settings] = lambda: app.state.settings
     app.dependency_overrides[_provider] = lambda: app.state.provider
@@ -236,8 +280,7 @@ def create_app(
     async def health() -> dict[str, Any]:
         return {
             "ok": "true",
-            "inspirations": db.inspiration_stats(),
-            "last_inspiration_sync_error": app.state.last_inspiration_sync_error,
+            "cases": db.public_case_stats(),
         }
 
     @app.get("/api/auth/public-settings")
@@ -260,6 +303,66 @@ def create_app(
         config = db.get_config(viewer.owner_id, settings, user_name=_viewer_name(viewer, settings))
         return _viewer_payload(viewer, config)
 
+    @app.get("/api/auth/key-groups")
+    async def auth_key_groups(
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
+        auth_client: Sub2APIAuthClient = Depends(_auth_client),
+    ) -> dict[str, Any]:
+        access_token = _require_access_token(viewer)
+        auth_base_url = _site_auth_base_url(db, settings)
+        try:
+            groups = await auth_client.list_available_groups(auth_base_url, access_token)
+            keys = await auth_client.list_keys(auth_base_url, access_token)
+        except ProviderError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        config = db.get_config(viewer.owner_id, settings, user_name=_viewer_name(viewer, settings))
+        selected_group_id = _selected_group_id_for_key(keys, str(config.get("managed_api_key") or config.get("api_key") or ""))
+        return {
+            "items": [_public_group(group) for group in groups if _group_id(group) is not None],
+            "selected_group_id": selected_group_id,
+            "create_group_url": auth_base_url,
+        }
+
+    @app.post("/api/auth/key-groups/select")
+    async def auth_select_key_group(
+        payload: AuthKeyGroupSelectRequest,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
+        auth_client: Sub2APIAuthClient = Depends(_auth_client),
+    ) -> dict[str, Any]:
+        access_token = _require_access_token(viewer)
+        auth_base_url = _site_auth_base_url(db, settings)
+        try:
+            groups = await auth_client.list_available_groups(auth_base_url, access_token)
+            group = _find_group(groups, payload.group_id)
+            if group is None:
+                raise HTTPException(status_code=404, detail="API key group not found")
+            keys = await auth_client.list_keys(auth_base_url, access_token)
+            selected_key = _select_key_for_group(keys, payload.group_id)
+            if selected_key is None:
+                selected_key = await auth_client.create_key(
+                    auth_base_url,
+                    access_token,
+                    {"name": "cybergen-image", "group_id": _group_id(group)},
+                )
+        except ProviderError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+        api_key = str(selected_key.get("key") or "").strip()
+        if not api_key:
+            raise HTTPException(status_code=502, detail="即刻 did not return a usable API key")
+        config = db.apply_managed_config(
+            viewer.owner_id,
+            settings,
+            api_key=api_key,
+            user_name=_viewer_name(viewer, settings),
+            base_url=_site_provider_base_url(db, settings),
+        )
+        return {"ok": True, "group": _public_group(group), "config": _public_config(config, viewer)}
+
     @app.get("/api/site-settings")
     async def get_site_settings(
         viewer: ViewerContext = Depends(_viewer),
@@ -277,11 +380,6 @@ def create_app(
     ) -> dict[str, Any]:
         _require_admin(viewer)
         updates = payload.model_dump(exclude_none=True)
-        if "inspiration_sources" in updates:
-            sources = normalize_inspiration_source_urls(updates["inspiration_sources"])
-            if not sources:
-                raise HTTPException(status_code=400, detail="At least one case source is required")
-            updates["inspiration_sources"] = sources
         for key in ("provider_base_url", "auth_base_url"):
             if key in updates:
                 updates[key] = _normalize_upstream_url(updates[key])
@@ -314,7 +412,6 @@ def create_app(
             viewer_payload = await _complete_auth_flow(
                 db,
                 settings,
-                auth_client,
                 request,
                 response,
                 result,
@@ -344,7 +441,6 @@ def create_app(
             viewer_payload = await _complete_auth_flow(
                 db,
                 settings,
-                auth_client,
                 request,
                 response,
                 result,
@@ -367,7 +463,6 @@ def create_app(
             viewer_payload = await _complete_auth_flow(
                 db,
                 settings,
-                auth_client,
                 request,
                 response,
                 result,
@@ -415,7 +510,7 @@ def create_app(
             locked = {"base_url", "usage_path", "user_name", "managed_by_auth"}
             if clear_api_key or locked.intersection(updates):
                 if locked.intersection(updates):
-                    raise HTTPException(status_code=403, detail="Signed-in accounts use a fixed JokoAI endpoint and profile")
+                    raise HTTPException(status_code=403, detail="Signed-in accounts use a fixed 即刻 endpoint and profile")
         if clear_api_key:
             updates["api_key"] = ""
         elif "api_key" in updates and updates["api_key"] == "":
@@ -492,41 +587,226 @@ def create_app(
     ) -> dict[str, Any]:
         return {"items": db.list_history(viewer.owner_id, limit=limit, offset=offset, q=q)}
 
-    @app.get("/api/inspirations")
-    async def inspirations(
+    @app.get("/api/cases")
+    async def public_cases(
         limit: int = 48,
         offset: int = 0,
         q: str = "",
-        section: str = "",
+        sort: str = "latest",
+        viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
     ) -> dict[str, Any]:
-        return {"items": db.list_inspirations(limit=limit, offset=offset, q=q, section=section)}
-
-    @app.get("/api/inspirations/stats")
-    async def inspiration_stats(db: Database = Depends(_db)) -> dict[str, Any]:
-        sources = db.get_site_settings().get("inspiration_sources") or [settings.inspiration_source_url]
+        sort_key = sort.strip().lower() or "latest"
+        if sort_key not in {"latest", "likes", "comments"}:
+            raise HTTPException(status_code=400, detail="Unsupported case sort")
         return {
-            **db.inspiration_stats(),
-            "source_url": sources[0] if sources else settings.inspiration_source_url,
-            "source_urls": sources,
-            "sync_interval_seconds": settings.inspiration_sync_interval_seconds,
-            "last_sync": app.state.last_inspiration_sync,
-            "last_error": app.state.last_inspiration_sync_error,
+            "items": db.list_public_cases(viewer.owner_id, limit=limit, offset=offset, q=q, sort=sort_key),
+            "total": db.count_public_cases(q=q),
+            "limit": max(1, min(limit, 200)),
+            "offset": max(0, offset),
+            "sort": sort_key,
         }
 
-    @app.post("/api/inspirations/sync")
-    async def inspiration_sync(
+    @app.get("/api/cases/stats")
+    async def public_case_stats(db: Database = Depends(_db)) -> dict[str, Any]:
+        return db.public_case_stats()
+
+    @app.get("/api/cases/{case_id}")
+    async def public_case_detail(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        item = db.get_public_case(case_id, viewer.owner_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
+    @app.post("/api/cases/{case_id}/like")
+    async def like_public_case(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_authenticated(viewer)
+        item = db.like_case(case_id, viewer.owner_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
+    @app.delete("/api/cases/{case_id}/like")
+    async def unlike_public_case(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_authenticated(viewer)
+        item = db.unlike_case(case_id, viewer.owner_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
+    @app.get("/api/cases/{case_id}/comments")
+    async def case_comments(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        if db.get_public_case(case_id, viewer.owner_id) is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return {"items": db.list_case_comments(case_id, viewer.owner_id)}
+
+    @app.post("/api/cases/{case_id}/comments")
+    async def create_case_comment(
+        case_id: str,
+        payload: CaseCommentRequest,
+        viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
         settings: Settings = Depends(_settings),
     ) -> dict[str, Any]:
+        _require_authenticated(viewer)
+        comment = db.create_case_comment(case_id, viewer.owner_id, _viewer_name(viewer, settings), payload.body)
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return comment
+
+    @app.put("/api/comments/{comment_id}")
+    async def update_case_comment(
+        comment_id: str,
+        payload: CaseCommentUpdate,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_authenticated(viewer)
+        if payload.status is not None and not viewer.is_admin:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        updates = payload.model_dump(exclude_unset=True)
+        if "status" in updates:
+            updates["status"] = _validate_comment_status(updates["status"])
         try:
-            result = await sync_inspirations(settings, db)
-            app.state.last_inspiration_sync = result
-            app.state.last_inspiration_sync_error = None
-            return result
-        except Exception as exc:
-            app.state.last_inspiration_sync_error = str(exc)
-            raise HTTPException(status_code=502, detail=f"Inspiration sync failed: {exc}") from exc
+            comment = db.update_case_comment(
+                comment_id,
+                owner_id=viewer.owner_id,
+                is_admin=viewer.is_admin,
+                body=updates.get("body"),
+                status=updates.get("status"),
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        return comment
+
+    @app.delete("/api/comments/{comment_id}")
+    async def delete_case_comment(
+        comment_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_authenticated(viewer)
+        try:
+            comment = db.update_case_comment(
+                comment_id,
+                owner_id=viewer.owner_id,
+                is_admin=viewer.is_admin,
+                status="deleted",
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        return comment
+
+    @app.get("/api/admin/cases")
+    async def admin_cases(
+        limit: int = 80,
+        offset: int = 0,
+        q: str = "",
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        return {"items": db.list_admin_cases(limit=limit, offset=offset, q=q)}
+
+    @app.post("/api/admin/cases")
+    async def admin_create_case(
+        payload: AdminCaseRequest,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        data = payload.model_dump(exclude_none=True)
+        data["status"] = _validate_case_status(data.get("status"))
+        if not data.get("image_url") and not data.get("image_path"):
+            raise HTTPException(status_code=400, detail="Case image URL is required")
+        return db.create_admin_case(viewer.owner_id, _viewer_name(viewer, settings), data)
+
+    @app.put("/api/admin/cases/{case_id}")
+    async def admin_update_case(
+        case_id: str,
+        payload: AdminCaseUpdate,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        data = payload.model_dump(exclude_unset=True)
+        if "status" in data:
+            data["status"] = _validate_case_status(data["status"])
+        item = db.update_case(case_id, data)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
+    @app.delete("/api/admin/cases/{case_id}")
+    async def admin_delete_case(
+        case_id: str,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        item = db.update_case(case_id, {"status": "deleted"})
+        if item is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return item
+
+    @app.get("/api/admin/comments")
+    async def admin_comments(
+        limit: int = 100,
+        offset: int = 0,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        return {"items": db.list_admin_comments(limit=limit, offset=offset)}
+
+    @app.post("/api/admin/comments")
+    async def admin_create_comment(
+        payload: AdminCommentRequest,
+        viewer: ViewerContext = Depends(_viewer),
+        db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        status = _validate_comment_status(payload.status)
+        comment = db.create_admin_case_comment(
+            payload.case_id,
+            viewer.owner_id,
+            (payload.author or _viewer_name(viewer, settings)).strip(),
+            payload.body,
+            status=status,
+        )
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return comment
+
+    @app.post("/api/admin/maintenance/cleanup-images")
+    async def admin_cleanup_images(
+        request: Request,
+        viewer: ViewerContext = Depends(_viewer),
+    ) -> dict[str, Any]:
+        _require_admin(viewer)
+        return _cleanup_expired_images(request.app)
 
     @app.get("/api/history/{history_id}")
     async def history_detail(
@@ -544,11 +824,26 @@ def create_app(
         history_id: str,
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
+        settings: Settings = Depends(_settings),
     ) -> dict[str, Any]:
+        record = db.get_history(viewer.owner_id, history_id)
+        file_paths = [
+            str(record.get(key) or "").strip()
+            for key in ("image_path", "input_image_path")
+            if record and str(record.get(key) or "").strip()
+        ]
         deleted = db.delete_history(viewer.owner_id, history_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="History item not found")
-        return {"ok": True}
+        referenced_paths = db.referenced_storage_paths(file_paths)
+        deletable_paths = [path for path in file_paths if path not in referenced_paths]
+        file_stats = delete_storage_files(settings, deletable_paths)
+        return {
+            "ok": True,
+            "candidate_files": len(file_paths),
+            "protected_files": len(referenced_paths),
+            **file_stats,
+        }
 
     @app.post("/api/history/{history_id}/publish")
     async def publish_history(
@@ -557,18 +852,19 @@ def create_app(
         db: Database = Depends(_db),
         settings: Settings = Depends(_settings),
     ) -> dict[str, Any]:
+        _require_authenticated(viewer)
         try:
-            inspiration = db.publish_history_as_inspiration(
+            case = db.publish_history_as_case(
                 viewer.owner_id,
                 history_id,
                 author=_viewer_name(viewer, settings),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if inspiration is None:
+        if case is None:
             raise HTTPException(status_code=404, detail="History item not found")
         item = db.get_history(viewer.owner_id, history_id)
-        return {"ok": True, "item": item, "inspiration": inspiration}
+        return {"ok": True, "item": item, "case": case}
 
     @app.delete("/api/history/{history_id}/publish")
     async def unpublish_history(
@@ -576,10 +872,11 @@ def create_app(
         viewer: ViewerContext = Depends(_viewer),
         db: Database = Depends(_db),
     ) -> dict[str, Any]:
+        _require_authenticated(viewer)
         history_item = db.get_history(viewer.owner_id, history_id)
         if history_item is None:
             raise HTTPException(status_code=404, detail="History item not found")
-        db.unpublish_history_inspiration(viewer.owner_id, history_id)
+        db.unpublish_history_case(viewer.owner_id, history_id)
         item = db.get_history(viewer.owner_id, history_id)
         return {"ok": True, "item": item}
 
@@ -727,6 +1024,84 @@ def _require_admin(viewer: ViewerContext) -> None:
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
+def _require_authenticated(viewer: ViewerContext) -> None:
+    if not viewer.authenticated:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _require_access_token(viewer: ViewerContext) -> str:
+    _require_authenticated(viewer)
+    token = str((viewer.session or {}).get("access_token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication token missing")
+    return token
+
+
+def _group_id(group: dict[str, Any]) -> Any | None:
+    return group.get("id") if group.get("id") is not None else group.get("group_id")
+
+
+def _public_group(group: dict[str, Any]) -> dict[str, Any]:
+    group_id = _group_id(group)
+    return {
+        "id": str(group_id),
+        "name": str(group.get("name") or group.get("display_name") or f"Group {group_id}"),
+        "platform": str(group.get("platform") or ""),
+    }
+
+
+def _find_group(groups: list[dict[str, Any]], group_id: str) -> dict[str, Any] | None:
+    wanted = str(group_id)
+    for group in groups:
+        if str(_group_id(group)) == wanted:
+            return group
+    return None
+
+
+def _select_key_for_group(keys: list[dict[str, Any]], group_id: str) -> dict[str, Any] | None:
+    wanted = str(group_id)
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, int]:
+        status = 0 if item.get("status") == "active" else 1
+        name = str(item.get("name") or "").strip().lower()
+        project_key = 0 if name in {"cybergen-image", "jike-image", "即刻-image", "即刻"} else 1
+        return status, project_key
+
+    matches = [
+        item
+        for item in keys
+        if isinstance(item.get("key"), str)
+        and item.get("key")
+        and isinstance(item.get("group"), dict)
+        and str(_group_id(item["group"])) == wanted
+    ]
+    return sorted(matches, key=sort_key)[0] if matches else None
+
+
+def _selected_group_id_for_key(keys: list[dict[str, Any]], api_key: str) -> str:
+    if not api_key:
+        return ""
+    for item in keys:
+        if item.get("key") == api_key and isinstance(item.get("group"), dict):
+            group_id = _group_id(item["group"])
+            return str(group_id) if group_id is not None else ""
+    return ""
+
+
+def _validate_case_status(value: Any) -> str:
+    status = str(value or "visible").strip()
+    if status not in {"visible", "hidden", "deleted"}:
+        raise HTTPException(status_code=400, detail="Unsupported case status")
+    return status
+
+
+def _validate_comment_status(value: Any) -> str:
+    status = str(value or "visible").strip()
+    if status not in {"visible", "hidden", "deleted"}:
+        raise HTTPException(status_code=400, detail="Unsupported comment status")
+    return status
+
+
 def _public_site_settings(settings_data: dict[str, Any], viewer: ViewerContext, settings: Settings) -> dict[str, Any]:
     payload = {
         "default_locale": settings_data["default_locale"],
@@ -736,10 +1111,12 @@ def _public_site_settings(settings_data: dict[str, Any], viewer: ViewerContext, 
             "body": settings_data["announcement_body"],
             "updated_at": settings_data["announcement_updated_at"],
         },
-        "inspiration_sources": settings_data.get("inspiration_sources") or [],
         "viewer": {
             "authenticated": viewer.authenticated,
             "is_admin": viewer.is_admin,
+        },
+        "image_retention": {
+            "days": settings.image_retention_days,
         },
     }
     if viewer.is_admin:
@@ -840,7 +1217,6 @@ def _set_session_cookie(response: Response, settings: Settings, session_id: str)
 async def _complete_auth_flow(
     db: Database,
     settings: Settings,
-    auth_client: Sub2APIAuthClient,
     request: Request,
     response: Response,
     auth_result: dict[str, Any],
@@ -848,14 +1224,12 @@ async def _complete_auth_flow(
     access_token = str(auth_result.get("access_token") or "").strip()
     user = auth_result.get("user")
     if not access_token or not isinstance(user, dict):
-        raise HTTPException(status_code=502, detail="JokoAI login response was missing user credentials")
+        raise HTTPException(status_code=502, detail="即刻 login response was missing user credentials")
 
     user_id = int(user["id"])
     owner_id = f"user:{user_id}"
     display_name = str(user.get("username") or user.get("email") or f"user-{user_id}")
-    auth_base_url = _site_auth_base_url(db, settings)
     provider_base_url = _site_provider_base_url(db, settings)
-    api_key = await _resolve_user_api_key(auth_client, auth_base_url, access_token)
 
     db.merge_owner_data(
         request.state.guest_owner_id,
@@ -863,10 +1237,9 @@ async def _complete_auth_flow(
         settings,
         user_name=display_name,
     )
-    config = db.apply_managed_config(
+    config = db.apply_authenticated_config(
         owner_id,
         settings,
-        api_key=api_key,
         user_name=display_name,
         base_url=provider_base_url,
     )
@@ -897,37 +1270,6 @@ async def _complete_auth_flow(
         ),
         config,
     )
-
-
-async def _resolve_user_api_key(
-    auth_client: Sub2APIAuthClient,
-    auth_base_url: str,
-    access_token: str,
-) -> str:
-    keys = await auth_client.list_keys(auth_base_url, access_token)
-    selected = _select_existing_key(keys)
-    if selected and selected.get("key"):
-        return str(selected["key"])
-
-    payload: dict[str, Any] = {"name": "cybergen-image"}
-    created = await auth_client.create_key(auth_base_url, access_token, payload)
-    key = str(created.get("key") or "").strip()
-    if not key:
-        raise HTTPException(status_code=502, detail="JokoAI did not return a usable API key")
-    return key
-
-
-def _select_existing_key(keys: list[dict[str, Any]]) -> dict[str, Any] | None:
-    def sort_key(item: dict[str, Any]) -> tuple[int, int]:
-        status = 0 if item.get("status") == "active" else 1
-        group = item.get("group") if isinstance(item.get("group"), dict) else {}
-        platform = 0 if group.get("platform") == "openai" else 1
-        return status, platform
-
-    candidates = [item for item in keys if isinstance(item.get("key"), str) and item.get("key")]
-    if not candidates:
-        return None
-    return sorted(candidates, key=sort_key)[0]
 
 
 def _client_ip(request: Request) -> str | None:
@@ -1190,6 +1532,55 @@ def _public_image_task(db: Database, owner_id: str, task: dict[str, Any]) -> dic
         "completed_at": task.get("completed_at"),
         "items": db.get_history_items(owner_id, history_ids),
         "result": task.get("result"),
+    }
+
+
+async def _cleanup_expired_images_loop(app: FastAPI) -> None:
+    interval = max(60, int(getattr(app.state.settings, "image_cleanup_interval_seconds", 6 * 60 * 60)))
+    while True:
+        try:
+            result = _cleanup_expired_images(app)
+            if result.get("deleted_history") or result.get("deleted_files"):
+                logger.info("Expired image cleanup completed: %s", result)
+        except Exception:
+            logger.exception("Expired image cleanup failed")
+        await asyncio.sleep(interval)
+
+
+def _cleanup_expired_images(app: FastAPI) -> dict[str, Any]:
+    settings: Settings = app.state.settings
+    db: Database = app.state.db
+    retention_days = int(getattr(settings, "image_retention_days", 2))
+    if retention_days <= 0:
+        return {
+            "enabled": False,
+            "retention_days": retention_days,
+            "cutoff": None,
+            "deleted_history": 0,
+            "protected_history": 0,
+            "deleted_tasks": 0,
+            "updated_tasks": 0,
+            "candidate_files": 0,
+            "protected_files": 0,
+            "deleted_files": 0,
+            "missing_files": 0,
+            "skipped_files": 0,
+            "file_errors": 0,
+        }
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).replace(microsecond=0).isoformat()
+    cleanup = db.cleanup_expired_history(cutoff)
+    file_paths = cleanup.pop("file_paths", [])
+    referenced_paths = db.referenced_storage_paths(file_paths)
+    deletable_paths = [path for path in file_paths if path not in referenced_paths]
+    file_stats = delete_storage_files(settings, deletable_paths)
+    return {
+        "enabled": True,
+        "retention_days": retention_days,
+        **cleanup,
+        "candidate_files": len(file_paths),
+        "protected_files": len(referenced_paths),
+        **file_stats,
     }
 
 

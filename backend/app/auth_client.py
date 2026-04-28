@@ -48,6 +48,10 @@ class Sub2APIAuthClient:
         )
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("groups") or data.get("data")
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
         return []
 
     async def create_key(self, base_url: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -59,7 +63,7 @@ class Sub2APIAuthClient:
             access_token=access_token,
         )
         if not isinstance(data, dict):
-            raise ProviderError(502, "JokoAI 返回的 API Key 数据格式不正确", data)
+            raise ProviderError(502, "即刻 返回的 API Key 数据格式不正确", data)
         return data
 
     async def list_usage(self, base_url: str, access_token: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -129,4 +133,4 @@ def _extract_error_message(payload: Any, response: httpx.Response) -> str:
             return str(error["message"])
         if error:
             return str(error)
-    return response.text[:1000] or f"JokoAI returned HTTP {response.status_code}"
+    return response.text[:1000] or f"即刻 returned HTTP {response.status_code}"

@@ -66,7 +66,7 @@ export default function Login() {
     <div className="px-6 py-24 max-w-[640px] mx-auto min-h-screen flex items-center">
       <section className="w-full border border-primary/25 bg-black/70 p-8 md:p-10 shadow-[0_0_40px_rgba(0,243,255,0.08)]">
         <div className="text-[10px] text-secondary uppercase tracking-widest font-bold mb-3">
-          joko-image {t('login_access')}
+          即刻 {t('login_access')}
         </div>
         <h1 className="text-3xl md:text-4xl font-black text-white mb-3 uppercase">
           {tempToken ? t('login_title_2fa') : t('login_title')}

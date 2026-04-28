@@ -2,6 +2,7 @@ import { CheckCircle2, Clock3, ImageIcon, Loader2, X, XCircle } from 'lucide-rea
 import { Link } from 'react-router-dom';
 import { useMemo, useState } from 'react';
 import { formatDate } from '../api';
+import ImagePreviewModal from './ImagePreviewModal';
 import { useSite } from '../site';
 import { useTasks } from '../tasks';
 
@@ -25,6 +26,7 @@ export default function TaskDrawer() {
   const { t } = useSite();
   const { tasks, drawerOpen, closeDrawer, activeCount } = useTasks();
   const [filter, setFilter] = useState<FilterKey>('all');
+  const [previewItem, setPreviewItem] = useState<{ imageUrl: string; prompt: string } | null>(null);
 
   const visibleTasks = useMemo(() => {
     if (filter === 'all') {
@@ -111,8 +113,28 @@ export default function TaskDrawer() {
               <div className="flex flex-col gap-3">
                 {visibleTasks.map((task) => {
                   const previewImage = task.items.find((item) => item.image_url)?.image_url || null;
+                  const canPreview = task.status === 'succeeded' && Boolean(previewImage);
                   return (
-                    <div key={task.id} className="border border-white/10 bg-black/30 p-3">
+                    <div
+                      key={task.id}
+                      className={`border border-white/10 bg-black/30 p-3 transition-colors ${
+                        canPreview ? 'cursor-zoom-in hover:border-primary/40 hover:bg-black/45' : ''
+                      }`}
+                      role={canPreview ? 'button' : undefined}
+                      tabIndex={canPreview ? 0 : undefined}
+                      onClick={() => {
+                        if (canPreview && previewImage) {
+                          setPreviewItem({ imageUrl: previewImage, prompt: task.prompt });
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (!canPreview || !previewImage || (event.key !== 'Enter' && event.key !== ' ')) {
+                          return;
+                        }
+                        event.preventDefault();
+                        setPreviewItem({ imageUrl: previewImage, prompt: task.prompt });
+                      }}
+                    >
                       <div className="mb-3 flex items-start justify-between gap-3">
                         <div className="flex min-w-0 items-center gap-2">
                           {statusIcon(task.status)}
@@ -155,6 +177,12 @@ export default function TaskDrawer() {
           </div>
         </div>
       </aside>
+      <ImagePreviewModal
+        imageUrl={previewItem?.imageUrl || null}
+        alt={previewItem?.prompt || 'preview'}
+        subtitle={previewItem?.prompt}
+        onClose={() => setPreviewItem(null)}
+      />
     </>
   );
 }

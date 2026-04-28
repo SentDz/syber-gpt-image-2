@@ -60,13 +60,13 @@ export default function TopNavBar() {
           {mobileMenuOpen ? <X size={18} /> : <Menu size={18} />}
         </button>
         <div className="flex items-center gap-4">
-          <img alt="joko-image" className="h-10 w-10 rounded-sm object-contain" src={jokoLogo} />
+          <img alt="即刻" className="h-10 w-10 rounded-sm object-contain" src={jokoLogo} />
           <div className="flex flex-col gap-1">
             <Link to="/" className="text-xl font-black tracking-tighter text-white hover:text-primary transition-colors sm:text-2xl">
-              joko-<span className="text-secondary">image</span>
+              即刻
             </Link>
             <div className="hidden w-fit border border-secondary/30 bg-secondary/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.25em] text-secondary sm:block">
-              JOKO-AI
+              即刻 AI
             </div>
           </div>
         </div>

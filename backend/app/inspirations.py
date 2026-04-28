@@ -7,9 +7,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import FastAPI
 
-from .db import Database
 from .settings import Settings
 from .storage import cache_remote_image
 
@@ -45,18 +43,6 @@ def normalize_inspiration_source_url(value: str) -> str:
         path = "/".join(parts[4:])
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
     return f"https://raw.githubusercontent.com/{owner}/{repo}/main/README.md"
-
-
-def normalize_inspiration_source_urls(values: list[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        url = normalize_inspiration_source_url(value)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        normalized.append(url)
-    return normalized
 
 
 def parse_inspiration_markdown(markdown: str, source_url: str) -> list[dict[str, Any]]:
@@ -110,60 +96,6 @@ def parse_inspiration_markdown(markdown: str, source_url: str) -> list[dict[str,
     return items
 
 
-async def sync_inspirations(settings: Settings, db: Database, source_urls: list[str] | None = None) -> dict[str, Any]:
-    urls = normalize_inspiration_source_urls(
-        source_urls or db.get_site_settings().get("inspiration_sources") or _settings_source_urls(settings)
-    )
-    if not urls:
-        raise ValueError("No inspiration source URLs configured")
-
-    parsed_total = 0
-    changed_total = 0
-    cached_total = 0
-    synced_at = None
-    source_results: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    image_cache_errors: list[dict[str, str]] = []
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        for source_url in urls:
-            try:
-                response = await client.get(source_url)
-                response.raise_for_status()
-                items = parse_inspiration_markdown(response.text, source_url)
-                cache_result = await cache_inspiration_images(settings, client, items)
-                result = db.upsert_inspirations(source_url, items)
-                parsed_total += len(items)
-                changed_total += int(result.get("count") or 0)
-                cached_total += int(cache_result.get("cached") or 0)
-                image_cache_errors.extend(cache_result.get("errors") or [])
-                synced_at = result.get("synced_at") or synced_at
-                source_results.append(
-                    {
-                        "source_url": source_url,
-                        "parsed": len(items),
-                        "cached_images": cache_result.get("cached", 0),
-                        "image_cache_errors": cache_result.get("errors", []),
-                        **result,
-                    }
-                )
-            except Exception as exc:
-                errors.append({"source_url": source_url, "error": str(exc)})
-    if errors and not source_results:
-        raise RuntimeError("; ".join(f"{item['source_url']}: {item['error']}" for item in errors))
-    return {
-        "ok": True,
-        "source_url": urls[0],
-        "source_urls": urls,
-        "parsed": parsed_total,
-        "count": changed_total,
-        "cached_images": cached_total,
-        "synced_at": synced_at,
-        "sources": source_results,
-        "errors": errors,
-        "image_cache_errors": image_cache_errors,
-    }
-
-
 async def cache_inspiration_images(
     settings: Settings,
     client: httpx.AsyncClient,
@@ -192,33 +124,6 @@ async def cache_inspiration_images(
     results = await asyncio.gather(*(cache_item(item) for item in items))
     errors = [{"url": result["url"], "error": result["error"]} for result in results if result.get("error")]
     return {"cached": sum(1 for result in results if result.get("cached")), "errors": errors}
-
-
-async def run_inspiration_sync_loop(app: FastAPI) -> None:
-    settings: Settings = app.state.settings
-    db: Database = app.state.db
-    try:
-        if settings.inspiration_sync_on_startup:
-            await _safe_sync(settings, db, app)
-        if settings.inspiration_sync_interval_seconds <= 0:
-            return
-        while True:
-            await asyncio.sleep(settings.inspiration_sync_interval_seconds)
-            await _safe_sync(settings, db, app)
-    except asyncio.CancelledError:
-        raise
-
-
-async def _safe_sync(settings: Settings, db: Database, app: FastAPI) -> None:
-    try:
-        app.state.last_inspiration_sync = await sync_inspirations(settings, db)
-        app.state.last_inspiration_sync_error = None
-    except Exception as exc:  # pragma: no cover - best effort background diagnostics.
-        app.state.last_inspiration_sync_error = str(exc)
-
-
-def _settings_source_urls(settings: Settings) -> list[str]:
-    return settings.inspiration_source_urls or [settings.inspiration_source_url]
 
 
 def _extract_prompt(block: str) -> str:

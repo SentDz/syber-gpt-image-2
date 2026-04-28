@@ -1,8 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
-import { ImagePlus, Grid, List, Maximize2, RefreshCw, Loader2, X } from 'lucide-react';
-import { editImage, generateImage, getConfig, getHistory, getInspirations, getInspirationStats, HistoryItem, InspirationItem } from '../api';
+import { ExternalLink, ImagePlus, Grid, List, Maximize2, RefreshCw, Loader2, X, Heart, MessageCircle } from 'lucide-react';
+import {
+  AuthKeyGroup,
+  CaseItem,
+  editImage,
+  generateImage,
+  getAuthKeyGroups,
+  getCases,
+  getConfig,
+  likeCase,
+  selectAuthKeyGroup,
+  unlikeCase,
+} from '../api';
+import type { CaseSort } from '../api';
 import { useAuth } from '../auth';
+import CaseDetailModal from '../components/CaseDetailModal';
 import ImagePreviewModal from '../components/ImagePreviewModal';
 import MasonryGrid from '../components/MasonryGrid';
 import { useSite } from '../site';
@@ -17,6 +30,9 @@ const SIZE_LABELS: Record<string, string> = {
 };
 const ASPECT_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
 const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
+const BATCH_COUNT_OPTIONS = ['1', '2', '3'];
+const BATCH_SUBMIT_DELAY_MS = 2000;
+const CASE_SORT_OPTIONS: CaseSort[] = ['latest', 'likes', 'comments'];
 const SIZE_PRESETS: Record<string, Record<string, string>> = {
   '1K': {
     '1:1': '1088x1088',
@@ -51,33 +67,35 @@ const SIZE_BY_PRESET_VALUE = Object.fromEntries(
   ),
 );
 
-function mergeHistory(items: HistoryItem[]) {
-  const merged = new Map<string, HistoryItem>();
-  for (const item of items) {
-    merged.set(item.id, item);
-  }
-  return [...merged.values()].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 export default function Home() {
   const { viewer } = useAuth();
   const { t } = useSite();
-  const { addTask, openDrawer, taskHistoryItems } = useTasks();
+  const { addTask, openDrawer } = useTasks();
   const [promptValue, setPromptValue] = useState('');
-  const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [inspirations, setInspirations] = useState<InspirationItem[]>([]);
+  const [cases, setCases] = useState<CaseItem[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [selectedPreviews, setSelectedPreviews] = useState<{ id: string; name: string; url: string }[]>([]);
   const [imageScale, setImageScale] = useState('2K');
   const [aspectRatio, setAspectRatio] = useState('1:1');
   const [imageQuality, setImageQuality] = useState('auto');
+  const [batchCount, setBatchCount] = useState('1');
+  const [keyGroups, setKeyGroups] = useState<AuthKeyGroup[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [keyGroupCreateUrl, setKeyGroupCreateUrl] = useState('');
+  const [keyGroupLoading, setKeyGroupLoading] = useState(false);
+  const [selectingGroup, setSelectingGroup] = useState(false);
   const [previewItem, setPreviewItem] = useState<{ imageUrl: string; prompt: string } | null>(null);
+  const [casePreviewItem, setCasePreviewItem] = useState<CaseItem | null>(null);
   const [loading, setLoading] = useState(false);
   const [feedLoading, setFeedLoading] = useState(true);
   const [loadingMoreFeed, setLoadingMoreFeed] = useState(false);
-  const [hasMoreInspirations, setHasMoreInspirations] = useState(true);
-  const [inspirationOffset, setInspirationOffset] = useState(0);
-  const [inspirationTotal, setInspirationTotal] = useState(0);
+  const [hasMoreCases, setHasMoreCases] = useState(true);
+  const [caseOffset, setCaseOffset] = useState(0);
+  const [caseSort, setCaseSort] = useState<CaseSort>('latest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -110,6 +128,33 @@ export default function Home() {
   }, [viewer?.owner_id]);
 
   useEffect(() => {
+    if (!viewer?.authenticated) {
+      setKeyGroups([]);
+      setSelectedGroupId('');
+      setKeyGroupCreateUrl('');
+      return;
+    }
+    let cancelled = false;
+    setKeyGroupLoading(true);
+    getAuthKeyGroups()
+      .then((result) => {
+        if (cancelled) return;
+        setKeyGroups(result.items);
+        setSelectedGroupId(result.selected_group_id || '');
+        setKeyGroupCreateUrl(result.create_group_url || '');
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setKeyGroupLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewer?.authenticated, viewer?.owner_id]);
+
+  useEffect(() => {
     if (!isSupportedImagePreset(imageScale, aspectRatio)) {
       setImageScale('2K');
     }
@@ -119,25 +164,18 @@ export default function Home() {
     let cancelled = false;
     setFeedLoading(true);
     setLoadingMoreFeed(false);
-    setHasMoreInspirations(true);
-    setInspirationOffset(0);
-    setInspirationTotal(0);
-    setInspirations([]);
+    setHasMoreCases(true);
+    setCaseOffset(0);
+    setCases([]);
     setError('');
-    const task = Promise.all([
-      getHistory({ limit: 12 }),
-      getInspirations({ limit: FEED_PAGE_SIZE, offset: 0 }),
-      getInspirationStats(),
-    ]);
+    const task = getCases({ limit: FEED_PAGE_SIZE, offset: 0, sort: caseSort });
     task
-      .then(([historyData, inspirationData, statsData]) => {
+      .then((caseData) => {
         if (cancelled) return;
-        setHistory(historyData.items.filter((item) => item.status === 'succeeded' && Boolean(item.image_url)));
-        setInspirations(inspirationData.items);
-        const nextTotal = Number(statsData.total || inspirationData.items.length || 0);
-        setInspirationTotal(nextTotal);
-        setInspirationOffset(inspirationData.items.length);
-        setHasMoreInspirations(inspirationData.items.length < nextTotal);
+        setCases(caseData.items);
+        const nextTotal = Number(caseData.total || caseData.items.length || 0);
+        setCaseOffset(caseData.items.length);
+        setHasMoreCases(caseData.items.length < nextTotal);
       })
       .catch((err) => {
         if (!cancelled) {
@@ -152,93 +190,146 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [viewer?.owner_id]);
+  }, [caseSort, viewer?.owner_id]);
 
-  const loadMoreInspirations = useCallback(async () => {
-    if (feedLoading || loadingMoreFeed || !hasMoreInspirations) {
+  const loadMoreCases = useCallback(async () => {
+    if (feedLoading || loadingMoreFeed || !hasMoreCases) {
       return;
     }
     setLoadingMoreFeed(true);
     try {
-      const data = await getInspirations({ limit: FEED_PAGE_SIZE, offset: inspirationOffset });
-      setInspirations((current) => {
+      const data = await getCases({ limit: FEED_PAGE_SIZE, offset: caseOffset, sort: caseSort });
+      setCases((current) => {
         const seen = new Set(current.map((item) => item.id));
         const nextItems = data.items.filter((item) => !seen.has(item.id));
         return [...current, ...nextItems];
       });
-      const nextOffset = inspirationOffset + data.items.length;
-      setInspirationOffset(nextOffset);
-      setHasMoreInspirations(inspirationTotal > 0 ? nextOffset < inspirationTotal : data.items.length === FEED_PAGE_SIZE);
+      const nextOffset = data.offset + data.items.length;
+      const nextTotal = Number(data.total || 0);
+      setCaseOffset(nextOffset);
+      setHasMoreCases(nextOffset < nextTotal);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoadingMoreFeed(false);
     }
-  }, [feedLoading, hasMoreInspirations, inspirationOffset, inspirationTotal, loadingMoreFeed]);
+  }, [caseOffset, caseSort, feedLoading, hasMoreCases, loadingMoreFeed]);
 
   useEffect(() => {
     const target = loadMoreRef.current;
-    if (!target || feedLoading || loadingMoreFeed || !hasMoreInspirations) {
+    if (!target || feedLoading || loadingMoreFeed || !hasMoreCases) {
       return;
     }
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries[0]?.isIntersecting) {
-          loadMoreInspirations().catch(() => undefined);
+          loadMoreCases().catch(() => undefined);
         }
       },
       { rootMargin: '480px 0px', threshold: 0.01 },
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [feedLoading, hasMoreInspirations, loadMoreInspirations, loadingMoreFeed]);
+  }, [feedLoading, hasMoreCases, loadMoreCases, loadingMoreFeed]);
 
   async function handleExecute() {
     const prompt = promptValue.trim();
     if (!prompt || loading) return;
+    if (viewer?.authenticated && (keyGroupLoading || selectingGroup)) {
+      setError(t('home_key_group_loading'));
+      return;
+    }
+    if (viewer?.authenticated && !keyGroupLoading && keyGroups.length === 0) {
+      setError(t('home_key_group_empty'));
+      return;
+    }
+    if (viewer?.authenticated && keyGroups.length > 0 && !selectedGroupId) {
+      setError(t('home_key_group_required'));
+      return;
+    }
     setLoading(true);
     setError('');
     const isEditMode = selectedFiles.length > 0;
+    const submitCount = isEditMode ? 1 : Math.max(1, Math.min(3, Number(batchCount) || 1));
     setMessage(isEditMode ? t('home_message_edit_sent') : t('home_message_generate_sent'));
     const imageOptions = {
       size: providerImageSize(imageScale, aspectRatio),
       aspect_ratio: aspectRatio,
       quality: imageQuality,
     };
+    let submittedCount = 0;
     try {
-      const submittedTask = isEditMode
-        ? await editImage({ prompt, ...imageOptions }, selectedFiles)
-        : await generateImage({ prompt, ...imageOptions });
-      addTask(submittedTask);
-      openDrawer();
-      setMessage(submittedTask.status === 'running' ? t('home_message_processing') : t('home_message_queued'));
+      if (isEditMode) {
+        const submittedTask = await editImage({ prompt, ...imageOptions }, selectedFiles);
+        submittedCount = 1;
+        addTask(submittedTask);
+        openDrawer();
+        setMessage(submittedTask.status === 'running' ? t('home_message_processing') : t('home_message_queued'));
+      } else {
+        for (let index = 0; index < submitCount; index += 1) {
+          setMessage(submitCount > 1 ? t('home_batch_submitting', { current: index + 1, total: submitCount }) : t('home_message_generate_sent'));
+          const submittedTask = await generateImage({ prompt, ...imageOptions });
+          submittedCount += 1;
+          addTask(submittedTask);
+          openDrawer();
+          if (index < submitCount - 1) {
+            await sleep(BATCH_SUBMIT_DELAY_MS);
+          }
+        }
+        setMessage(submitCount > 1 ? t('home_batch_queued', { value: submittedCount }) : t('home_message_queued'));
+      }
       setSelectedFiles([]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setMessage('');
+      setMessage(submittedCount > 0 ? t('home_batch_queued', { value: submittedCount }) : '');
     } finally {
       setLoading(false);
     }
   }
 
-  const mergedHistory = mergeHistory([
-    ...taskHistoryItems.filter((item) => item.status === 'succeeded' && Boolean(item.image_url)),
-    ...history,
-  ]);
+  async function handleKeyGroupChange(groupId: string) {
+    setSelectedGroupId(groupId);
+    if (!groupId) return;
+    setSelectingGroup(true);
+    setError('');
+    try {
+      const result = await selectAuthKeyGroup(groupId);
+      setSelectedGroupId(result.group.id);
+      setMessage(t('home_key_group_selected', { value: result.group.name }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSelectingGroup(false);
+    }
+  }
 
-  const generatedFeed = mergedHistory.map((item) => ({
-        id: `ID:${item.id.slice(0, 4).toUpperCase()}`,
-        img: item.image_url || '',
-        prompt: item.prompt,
-        title: item.mode.toUpperCase(),
-      }));
-  const inspirationFeed = inspirations.map((item) => ({
-    id: item.author || item.section,
+  const caseFeed = cases.map((item) => ({
+    case: item,
+    id: item.author || t('case_public_gallery'),
     img: item.image_url || '',
     prompt: item.prompt,
     title: item.title,
+    like_count: item.like_count,
+    comment_count: item.comment_count,
+    liked: item.liked,
   }));
-  const visibleFeed = [...generatedFeed, ...inspirationFeed].filter((item) => item.img);
+  const visibleFeed = caseFeed.filter((item) => item.img);
+  const replaceCase = (nextCase: CaseItem) => {
+    setCases((current) => current.map((item) => (item.id === nextCase.id ? nextCase : item)));
+    setCasePreviewItem((current) => (current?.id === nextCase.id ? nextCase : current));
+  };
+  const handleCaseLike = async (item: CaseItem) => {
+    if (!viewer?.authenticated) {
+      setError(t('case_login_required'));
+      return;
+    }
+    try {
+      const next = item.liked ? await unlikeCase(item.id) : await likeCase(item.id);
+      replaceCase(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
   const handleAspectRatioChange = (nextRatio: string) => {
     setAspectRatio(nextRatio);
     if (nextRatio === '1:1' && imageScale === '4K') {
@@ -280,6 +371,26 @@ export default function Home() {
         </div>
       </div>
 
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border border-white/10 bg-black/25 px-4 py-3">
+        <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/40">{t('home_sort_label')}</div>
+        <div className="grid grid-cols-3 gap-2">
+          {CASE_SORT_OPTIONS.map((sort) => (
+            <button
+              key={sort}
+              className={`h-9 border px-3 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                caseSort === sort
+                  ? 'border-primary bg-primary/12 text-primary'
+                  : 'border-white/10 bg-white/5 text-white/50 hover:border-white/25 hover:text-white'
+              }`}
+              type="button"
+              onClick={() => setCaseSort(sort)}
+            >
+              {caseSortLabel(sort, t)}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {error && <div className="mb-6 border border-error/40 bg-error/10 p-4 text-error text-xs">{error}</div>}
 
       {feedLoading ? (
@@ -302,16 +413,16 @@ export default function Home() {
         </div>
       ) : visibleFeed.length > 0 ? (
         <>
-          <MasonryGrid
-            items={visibleFeed}
-            getKey={(item, index) => `${item.id}-${index}`}
-            renderItem={(item) => (
-              <div className="overflow-hidden border border-primary/30 bg-black">
-                <button
-                  className="block w-full cursor-zoom-in bg-black text-left"
-                  type="button"
-                  onClick={() => setPreviewItem({ imageUrl: item.img, prompt: item.prompt })}
-                >
+	          <MasonryGrid
+	            items={visibleFeed}
+	            getKey={(item, index) => `${item.id}-${index}`}
+	            renderItem={(item) => (
+	              <div className="overflow-hidden border border-primary/30 bg-black">
+	                <button
+	                  className="block w-full cursor-zoom-in bg-black text-left"
+	                  type="button"
+	                  onClick={() => setCasePreviewItem(item.case)}
+	                >
                   <img
                     alt={item.id}
                     className="block h-auto w-full opacity-95 transition-opacity duration-300 hover:opacity-100"
@@ -319,23 +430,40 @@ export default function Home() {
                     src={item.img}
                   />
                 </button>
-                <div className="border-t border-primary/15 bg-surface-container-low/80 p-4">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    {'title' in item && item.title ? (
-                      <div className="min-w-0 truncate text-[10px] uppercase tracking-widest text-secondary">{item.title}</div>
+	                <div className="border-t border-primary/15 bg-surface-container-low/80 p-4">
+	                  <div className="mb-2 flex items-center justify-between gap-3">
+	                    {'title' in item && item.title ? (
+	                      <div className="min-w-0 truncate text-[10px] uppercase tracking-widest text-secondary">{item.title}</div>
                     ) : (
                       <div className="min-w-0 truncate font-code-data text-[10px] text-white/35">{item.id}</div>
                     )}
-                    <div className="shrink-0 font-code-data text-[10px] text-white/25">{item.id}</div>
-                  </div>
-                  <p className="mb-3 line-clamp-3 text-sm text-white/80">{item.prompt}</p>
-                  <div className="grid grid-cols-[44px_1fr] gap-2">
-                    <button
-                      className="flex h-10 items-center justify-center border border-white/10 bg-white/5 text-white/70 transition-all duration-300 hover:border-primary hover:text-primary"
-                      type="button"
-                      onClick={() => setPreviewItem({ imageUrl: item.img, prompt: item.prompt })}
-                      title={t('history_preview')}
-                    >
+	                    <div className="shrink-0 font-code-data text-[10px] text-white/25">{item.id}</div>
+	                  </div>
+                    <div className="mb-3 flex items-center gap-2 text-[10px] uppercase tracking-widest text-white/40">
+                      <button
+                        className={`flex items-center gap-1 transition-colors ${item.liked ? 'text-secondary' : 'hover:text-secondary'}`}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleCaseLike(item.case).catch(() => undefined);
+                        }}
+                      >
+                        <Heart size={13} />
+                        {item.like_count}
+                      </button>
+                      <span className="flex items-center gap-1">
+                        <MessageCircle size={13} />
+                        {item.comment_count}
+                      </span>
+                    </div>
+	                  <p className="mb-3 line-clamp-3 text-sm text-white/80">{item.prompt}</p>
+	                  <div className="grid grid-cols-[44px_1fr] gap-2">
+	                    <button
+	                      className="flex h-10 items-center justify-center border border-white/10 bg-white/5 text-white/70 transition-all duration-300 hover:border-primary hover:text-primary"
+	                      type="button"
+	                      onClick={() => setCasePreviewItem(item.case)}
+	                      title={t('history_preview')}
+	                    >
                       <Maximize2 size={15} />
                     </button>
                   <button
@@ -359,12 +487,12 @@ export default function Home() {
                 <Loader2 className="animate-spin" size={16} />
                 {t('home_loading_more')}
               </div>
-            ) : hasMoreInspirations ? (
-              <button
-                className="border border-primary/30 bg-primary/5 px-6 py-3 text-xs font-bold uppercase tracking-[0.25em] text-primary transition-colors hover:bg-primary/10"
-                type="button"
-                onClick={() => loadMoreInspirations().catch(() => undefined)}
-              >
+	            ) : hasMoreCases ? (
+	              <button
+	                className="border border-primary/30 bg-primary/5 px-6 py-3 text-xs font-bold uppercase tracking-[0.25em] text-primary transition-colors hover:bg-primary/10"
+	                type="button"
+	                onClick={() => loadMoreCases().catch(() => undefined)}
+	              >
                 {t('home_load_more')}
               </button>
             ) : (
@@ -380,7 +508,7 @@ export default function Home() {
       )}
 
       <div className="fixed bottom-6 left-6 right-6 md:left-auto md:right-auto md:w-[calc(100%-3rem)] max-w-[960px] mx-auto bg-surface-container/90 backdrop-blur-xl border border-primary/40 p-5 rounded-sm shadow-[0_-20px_40px_rgba(0,0,0,0.8)] z-50 font-mono">
-          <div className="flex items-center gap-4 mb-4">
+          <div className="flex flex-wrap items-center gap-3 mb-4">
             <div className="flex items-center gap-2 text-[10px] text-white/50 border-r border-white/10 pr-4">
              <span className="w-2 h-2 bg-secondary rounded-full animate-pulse"></span> {t('home_mode')}: {selectedFiles.length ? t('home_mode_edit') : t('home_mode_generate')}
           </div>
@@ -390,12 +518,42 @@ export default function Home() {
             <span>{providerImageSize(imageScale, aspectRatio)}</span>
             <span>{imageQuality}</span>
           </div>
+          {viewer?.authenticated ? (
+            <div className="flex min-w-0 items-center gap-2 border-l border-white/10 pl-3">
+              <span className="hidden shrink-0 text-[10px] uppercase tracking-widest text-white/35 sm:inline">{t('home_key_group')}</span>
+              {keyGroups.length > 0 || keyGroupLoading ? (
+                <select
+                  className="h-8 max-w-[42vw] border border-primary/20 bg-black px-2 text-[10px] uppercase tracking-widest text-primary outline-none transition-colors focus:border-primary sm:max-w-56"
+                  value={selectedGroupId}
+                  onChange={(event) => handleKeyGroupChange(event.target.value)}
+                  disabled={keyGroupLoading || selectingGroup}
+                >
+                  <option value="">{keyGroupLoading ? t('home_key_group_loading') : t('home_key_group_placeholder')}</option>
+                  {keyGroups.map((group) => (
+                    <option key={group.id} value={group.id}>
+                      {group.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <button
+                  className="flex h-8 items-center gap-2 border border-secondary/30 px-3 text-[10px] uppercase tracking-widest text-secondary transition-colors hover:bg-secondary/10"
+                  type="button"
+                  onClick={() => keyGroupCreateUrl && window.open(keyGroupCreateUrl, '_blank', 'noopener,noreferrer')}
+                >
+                  <ExternalLink size={12} />
+                  {t('home_key_group_create')}
+                </button>
+              )}
+              {selectingGroup ? <Loader2 className="shrink-0 animate-spin text-primary" size={13} /> : null}
+            </div>
+          ) : null}
           <div className="text-[10px] text-primary uppercase tracking-widest truncate">
             {message || (promptValue ? t('home_message_loaded') : t('home_message_waiting'))}
           </div>
         </div>
 
-        <div className="mb-4 grid grid-cols-3 gap-2">
+        <div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
           <GenerationSelect
             label={t('home_size')}
             value={imageScale}
@@ -406,6 +564,14 @@ export default function Home() {
           />
           <GenerationSelect label={t('home_aspect_ratio')} value={aspectRatio} onChange={handleAspectRatioChange} options={ASPECT_RATIO_OPTIONS} />
           <GenerationSelect label={t('home_quality')} value={imageQuality} onChange={setImageQuality} options={QUALITY_OPTIONS} />
+          <GenerationSelect
+            label={t('home_batch_count')}
+            value={selectedFiles.length ? '1' : batchCount}
+            onChange={setBatchCount}
+            options={BATCH_COUNT_OPTIONS}
+            getOptionLabel={(option) => t('home_batch_option', { value: option })}
+            disabled={selectedFiles.length > 0}
+          />
         </div>
 
         <div className="flex flex-col sm:flex-row gap-4">
@@ -482,6 +648,11 @@ export default function Home() {
         subtitle={previewItem?.prompt}
         onClose={() => setPreviewItem(null)}
       />
+      <CaseDetailModal
+        item={casePreviewItem}
+        onClose={() => setCasePreviewItem(null)}
+        onCaseChange={replaceCase}
+      />
     </div>
   );
 }
@@ -493,6 +664,7 @@ function GenerationSelect({
   onChange,
   isOptionDisabled,
   getOptionLabel,
+  disabled = false,
 }: {
   label: string;
   value: string;
@@ -500,14 +672,16 @@ function GenerationSelect({
   onChange: (value: string) => void;
   isOptionDisabled?: (value: string) => boolean;
   getOptionLabel?: (value: string) => string;
+  disabled?: boolean;
 }) {
   return (
     <label className="min-w-0">
       <span className="mb-1 block truncate text-[9px] uppercase tracking-[0.2em] text-white/40">{label}</span>
       <select
-        className="h-10 w-full border border-primary/20 bg-black px-2 text-xs uppercase text-primary outline-none transition-colors focus:border-primary"
+        className="h-10 w-full border border-primary/20 bg-black px-2 text-xs uppercase text-primary outline-none transition-colors focus:border-primary disabled:cursor-not-allowed disabled:opacity-45"
         value={value}
         onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
       >
         {options.map((option) => (
           <option key={option} value={option} disabled={isOptionDisabled?.(option) || false}>
@@ -545,4 +719,10 @@ function providerImageSize(scale: string, ratio: string) {
 
 function isSupportedImagePreset(scale: string, ratio: string) {
   return Boolean(SIZE_PRESETS[scale]?.[ratio]);
+}
+
+function caseSortLabel(sort: CaseSort, t: ReturnType<typeof useSite>['t']) {
+  if (sort === 'likes') return t('home_sort_likes');
+  if (sort === 'comments') return t('home_sort_comments');
+  return t('home_sort_latest');
 }

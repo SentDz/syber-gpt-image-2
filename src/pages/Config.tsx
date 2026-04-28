@@ -4,20 +4,18 @@ import { Activity, ArrowRight, BellRing, EyeOff, Globe2, Loader2, PlugZap, Save,
 import {
   AccountInfo,
   AppConfig,
-  InspirationStats,
   LedgerEntry,
   formatBalance,
   formatDate,
   getAccount,
   getConfig,
-  getInspirationStats,
   getLedger,
   saveConfig,
-  syncInspirations,
   testConfig,
   updateSiteSettings,
 } from '../api';
 import { useAuth } from '../auth';
+import AdminCaseManager from '../components/AdminCaseManager';
 import AvatarBadge from '../components/AvatarBadge';
 import { useSite } from '../site';
 
@@ -34,13 +32,11 @@ export default function Config() {
   const [apiKey, setApiKey] = useState('');
   const [account, setAccount] = useState<AccountInfo | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
-  const [inspirationStats, setInspirationStats] = useState<InspirationStats | null>(null);
   const [siteDraft, setSiteDraft] = useState<{
     default_locale: LocaleValue;
     announcement_enabled: boolean;
     announcement_title: string;
     announcement_body: string;
-    inspiration_sources: string;
     provider_base_url: string;
     auth_base_url: string;
   }>({
@@ -48,7 +44,6 @@ export default function Config() {
     announcement_enabled: false,
     announcement_title: '',
     announcement_body: '',
-    inspiration_sources: '',
     provider_base_url: '',
     auth_base_url: '',
   });
@@ -58,16 +53,14 @@ export default function Config() {
   const [siteSaving, setSiteSaving] = useState(false);
 
   async function refresh() {
-    const [configData, accountData, ledgerData, inspirationData] = await Promise.all([
+    const [configData, accountData, ledgerData] = await Promise.all([
       getConfig(),
       getAccount(),
       getLedger(8),
-      getInspirationStats(),
     ]);
     setConfig(configData);
     setAccount(accountData);
     setLedger(ledgerData.items);
-    setInspirationStats(inspirationData);
   }
 
   useEffect(() => {
@@ -80,22 +73,20 @@ export default function Config() {
     }
     setSiteDraft({
       default_locale: normalizeLocale(siteSettings.default_locale),
-      announcement_enabled: siteSettings.announcement.enabled,
-      announcement_title: siteSettings.announcement.title,
-      announcement_body: siteSettings.announcement.body,
-      inspiration_sources: (siteSettings.inspiration_sources || []).join('\n'),
-      provider_base_url: siteSettings.upstream?.provider_base_url || '',
-      auth_base_url: siteSettings.upstream?.auth_base_url || '',
-    });
+	      announcement_enabled: siteSettings.announcement.enabled,
+	      announcement_title: siteSettings.announcement.title,
+	      announcement_body: siteSettings.announcement.body,
+	      provider_base_url: siteSettings.upstream?.provider_base_url || '',
+	      auth_base_url: siteSettings.upstream?.auth_base_url || '',
+	    });
   }, [
     siteSettings?.default_locale,
     siteSettings?.announcement.enabled,
     siteSettings?.announcement.title,
     siteSettings?.announcement.body,
-    siteSettings?.inspiration_sources,
-    siteSettings?.upstream?.provider_base_url,
-    siteSettings?.upstream?.auth_base_url,
-  ]);
+	    siteSettings?.upstream?.provider_base_url,
+	    siteSettings?.upstream?.auth_base_url,
+	  ]);
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -136,21 +127,6 @@ export default function Config() {
     }
   }
 
-  async function handleSyncInspirations() {
-    setSaving(true);
-    setError('');
-    setStatus('');
-    try {
-      const result = await syncInspirations();
-      await refresh();
-      setStatus(t('config_status_synced', { value: result.parsed }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   async function handleResetKey() {
     if (!config?.managed_by_auth) return;
     setSaving(true);
@@ -175,18 +151,14 @@ export default function Config() {
     setError('');
     setStatus('');
     try {
-      const updated = await updateSiteSettings({
-        default_locale: siteDraft.default_locale,
-        announcement_enabled: siteDraft.announcement_enabled,
-        announcement_title: siteDraft.announcement_title.trim(),
-        announcement_body: siteDraft.announcement_body.trim(),
-        provider_base_url: siteDraft.provider_base_url.trim(),
-        auth_base_url: siteDraft.auth_base_url.trim(),
-        inspiration_sources: siteDraft.inspiration_sources
-          .split('\n')
-          .map((item) => item.trim())
-          .filter(Boolean),
-      });
+	      const updated = await updateSiteSettings({
+	        default_locale: siteDraft.default_locale,
+	        announcement_enabled: siteDraft.announcement_enabled,
+	        announcement_title: siteDraft.announcement_title.trim(),
+	        announcement_body: siteDraft.announcement_body.trim(),
+	        provider_base_url: siteDraft.provider_base_url.trim(),
+	        auth_base_url: siteDraft.auth_base_url.trim(),
+	      });
       setLocale(normalizeLocale(updated.default_locale));
       await refreshSiteSettings();
       setStatus(t('config_status_site_saved'));
@@ -197,10 +169,10 @@ export default function Config() {
     }
   }
 
-  function handleLocaleChange(nextLocale: LocaleValue) {
-    setLocale(nextLocale);
-    setSiteDraft((current) => ({ ...current, default_locale: nextLocale }));
-  }
+	  function handleLocaleChange(nextLocale: LocaleValue) {
+	    setLocale(nextLocale);
+	    setSiteDraft((current) => ({ ...current, default_locale: nextLocale }));
+	  }
 
   return (
     <div className="md:ml-64 px-6 md:px-12 py-8 max-w-[1440px] mx-auto min-h-screen pt-24 pb-12 bg-[radial-gradient(ellipse_at_top,var(--color-surface-container-high),var(--color-background))] font-mono">
@@ -274,63 +246,6 @@ export default function Config() {
               <p className="text-white/50 text-xs leading-relaxed">
                 {config?.managed_by_auth ? t('config_user_desc') : t('config_guest_desc')}
               </p>
-            </div>
-          </div>
-
-          <div className="bg-secondary/5 border border-secondary/20 p-4 mb-8 text-xs text-white/50 flex flex-col gap-4">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="text-secondary uppercase tracking-widest text-[10px] mb-1">{t('config_cases')}</div>
-                <div>{t('config_cases_summary', { total: inspirationStats?.total ?? 0, time: formatDate(inspirationStats?.last_synced_at) })}</div>
-                <div className="mt-1 text-[10px] uppercase tracking-widest text-white/30">
-                  {t('config_cases_sources', { value: inspirationStats?.source_urls?.length || 0 })}
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-3">
-                {siteSettings?.viewer.is_admin ? (
-                  <button
-                    className="border border-primary/40 text-primary px-4 py-2 uppercase tracking-widest hover:bg-primary/10 transition-colors disabled:opacity-50"
-                    type="button"
-                    onClick={handleSaveSiteSettings}
-                    disabled={siteSaving}
-                  >
-                    {siteSaving ? <Loader2 className="inline animate-spin mr-2" size={13} /> : null}
-                    {t('config_save_case_sources')}
-                  </button>
-                ) : null}
-                <button
-                  className="border border-secondary/40 text-secondary px-4 py-2 uppercase tracking-widest hover:bg-secondary/10 transition-colors disabled:opacity-50"
-                  type="button"
-                  onClick={handleSyncInspirations}
-                  disabled={saving}
-                >
-                  {t('config_sync_cases')}
-                </button>
-              </div>
-            </div>
-
-            <div className="border-t border-secondary/10 pt-4">
-              <Field label={t('site_inspiration_sources_body')}>
-                <textarea
-                  className="input-cyber min-h-28 resize-y"
-                  disabled={!siteSettings?.viewer.is_admin}
-                  value={siteDraft.inspiration_sources}
-                  onChange={(event) => setSiteDraft((current) => ({ ...current, inspiration_sources: event.target.value }))}
-                />
-              </Field>
-              {!siteSettings?.viewer.is_admin ? (
-                <div className="mt-2 text-[10px] uppercase tracking-widest text-white/30">{t('site_admin_only')}</div>
-              ) : null}
-              {inspirationStats?.source_counts?.length ? (
-                <div className="mt-4 grid grid-cols-1 gap-2 text-[10px] text-white/45 md:grid-cols-2">
-                  {inspirationStats.source_counts.map((source) => (
-                    <div key={source.source_url} className="flex items-center justify-between gap-3 border border-white/5 bg-black/20 px-3 py-2">
-                      <span className="min-w-0 truncate">{source.source_url}</span>
-                      <span className="shrink-0 text-primary">{source.count}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
             </div>
           </div>
 
@@ -490,10 +405,10 @@ export default function Config() {
                 </div>
               ) : null}
 
-              <div className="border border-secondary/20 bg-secondary/5 p-4">
-                <div className="mb-4 flex items-center gap-2 text-[10px] uppercase tracking-widest text-secondary">
-                  <BellRing size={15} />
-                  {t('site_announcement')}
+	              <div className="border border-secondary/20 bg-secondary/5 p-4">
+	                <div className="mb-4 flex items-center gap-2 text-[10px] uppercase tracking-widest text-secondary">
+	                  <BellRing size={15} />
+	                  {t('site_announcement')}
                 </div>
 
                 <label className="mb-4 flex items-center gap-3 text-xs text-white/70">
@@ -525,11 +440,11 @@ export default function Config() {
                       onChange={(event) => setSiteDraft((current) => ({ ...current, announcement_body: event.target.value }))}
                     />
                   </Field>
-                </div>
-              </div>
+	                </div>
+	              </div>
 
-              {siteSettings?.viewer.is_admin ? (
-                <button
+	              {siteSettings?.viewer.is_admin ? (
+	                <button
                   className="w-full bg-secondary text-white font-bold px-6 py-3 uppercase tracking-widest hover:bg-white hover:text-black transition-colors disabled:opacity-50 flex items-center justify-center gap-2 text-xs"
                   type="button"
                   onClick={handleSaveSiteSettings}
@@ -574,6 +489,8 @@ export default function Config() {
             </Link>
           </div>
         </div>
+
+        {siteSettings?.viewer.is_admin ? <AdminCaseManager /> : null}
       </div>
     </div>
   );

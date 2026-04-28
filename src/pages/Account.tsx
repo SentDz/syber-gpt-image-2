@@ -63,7 +63,7 @@ export default function Account() {
           </div>
         </section>
 
-        <Metric icon={Activity} label={t('account_balance')} value={formatBalance(account?.balance)} sub={account?.balance.ok ? 'JokoAI /v1/usage' : account?.balance.message || 'Not connected'} />
+        <Metric icon={Activity} label={t('account_balance')} value={formatBalance(account?.balance)} sub={account?.balance.ok ? '即刻 /v1/usage' : account?.balance.message || 'Not connected'} />
         <Metric icon={Database} label={t('account_history')} value={String(account?.stats.total ?? 0)} sub={t('account_succeeded', { value: account?.stats.succeeded ?? 0 })} />
         <Metric icon={Server} label={t('account_edits')} value={String(account?.stats.edits ?? 0)} sub={t('account_last', { value: formatDate(account?.stats.last_generation_at) })} />
       </div>
