@@ -7,7 +7,6 @@ import {
   editImage,
   generateImage,
   getAuthKeyGroups,
-  getCases,
   getConfig,
   likeCase,
   selectAuthKeyGroup,
@@ -21,7 +20,6 @@ import MasonryGrid from '../components/MasonryGrid';
 import { useSite } from '../site';
 import { useTasks } from '../tasks';
 
-const FEED_PAGE_SIZE = 24;
 const SIZE_OPTIONS = ['1K', '2K', '4K'];
 const SIZE_LABELS: Record<string, string> = {
   '1K': '1K (1080p)',
@@ -91,10 +89,9 @@ export default function Home() {
   const [previewItem, setPreviewItem] = useState<{ imageUrl: string; prompt: string } | null>(null);
   const [casePreviewItem, setCasePreviewItem] = useState<CaseItem | null>(null);
   const [loading, setLoading] = useState(false);
-  const [feedLoading, setFeedLoading] = useState(true);
+  const [feedLoading, setFeedLoading] = useState(false);
   const [loadingMoreFeed, setLoadingMoreFeed] = useState(false);
-  const [hasMoreCases, setHasMoreCases] = useState(true);
-  const [caseOffset, setCaseOffset] = useState(0);
+  const [hasMoreCases, setHasMoreCases] = useState(false);
   const [caseSort, setCaseSort] = useState<CaseSort>('latest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -161,59 +158,16 @@ export default function Home() {
   }, [aspectRatio, imageScale]);
 
   useEffect(() => {
-    let cancelled = false;
-    setFeedLoading(true);
     setLoadingMoreFeed(false);
-    setHasMoreCases(true);
-    setCaseOffset(0);
+    setFeedLoading(false);
+    setHasMoreCases(false);
     setCases([]);
-    setError('');
-    const task = getCases({ limit: FEED_PAGE_SIZE, offset: 0, sort: caseSort });
-    task
-      .then((caseData) => {
-        if (cancelled) return;
-        setCases(caseData.items);
-        const nextTotal = Number(caseData.total || caseData.items.length || 0);
-        setCaseOffset(caseData.items.length);
-        setHasMoreCases(caseData.items.length < nextTotal);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setError(err.message);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setFeedLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [caseSort, viewer?.owner_id]);
 
   const loadMoreCases = useCallback(async () => {
-    if (feedLoading || loadingMoreFeed || !hasMoreCases) {
-      return;
-    }
-    setLoadingMoreFeed(true);
-    try {
-      const data = await getCases({ limit: FEED_PAGE_SIZE, offset: caseOffset, sort: caseSort });
-      setCases((current) => {
-        const seen = new Set(current.map((item) => item.id));
-        const nextItems = data.items.filter((item) => !seen.has(item.id));
-        return [...current, ...nextItems];
-      });
-      const nextOffset = data.offset + data.items.length;
-      const nextTotal = Number(data.total || 0);
-      setCaseOffset(nextOffset);
-      setHasMoreCases(nextOffset < nextTotal);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingMoreFeed(false);
-    }
-  }, [caseOffset, caseSort, feedLoading, hasMoreCases, loadingMoreFeed]);
+    setLoadingMoreFeed(false);
+    setHasMoreCases(false);
+  }, []);
 
   useEffect(() => {
     const target = loadMoreRef.current;
