@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { getImageTask, HistoryItem, ImageTask, listImageTasks } from './api';
+import { HistoryItem, ImageTask, listImageTasks } from './api';
 import { useAuth } from './auth';
 
 export type TaskToast = {
@@ -189,11 +189,12 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
       }
       polling = true;
       try {
-        const updates = await Promise.all(activeTaskIds.map((taskId) => getImageTask(taskId).catch(() => null)));
+        const response = await listImageTasks({ limit: TASK_FETCH_LIMIT });
         if (cancelled) {
           return;
         }
-        const nextTasks = updates.filter((task): task is ImageTask => Boolean(task));
+        const activeTaskIdSet = new Set(activeTaskIds);
+        const nextTasks = response.items.filter((task) => activeTaskIdSet.has(task.id));
         if (nextTasks.length > 0) {
           const previous = tasksRef.current;
           const merged = mergeTasks(previous, nextTasks);

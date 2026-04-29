@@ -275,6 +275,12 @@ def create_app(
                 request.state.viewer_owner_id = session["owner_id"]
 
         response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["CDN-Cache-Control"] = "no-store"
+            response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         _set_guest_cookie(response, settings, guest_id)
         if request.state.clear_session_cookie:
             response.delete_cookie(settings.session_cookie_name, path="/")

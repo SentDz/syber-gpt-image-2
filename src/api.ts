@@ -243,8 +243,10 @@ export type LoginResult = {
 };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method || 'GET').toUpperCase();
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'include',
+    cache: method === 'GET' ? 'no-store' : options?.cache,
     ...options,
     headers: {
       ...(options?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
@@ -523,7 +525,7 @@ export async function waitForImageTask(
     onUpdate?: (task: ImageTask) => void;
   } = {},
 ) {
-  const intervalMs = options.intervalMs ?? 1500;
+  const intervalMs = options.intervalMs ?? 5000;
   const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
   const startedAt = Date.now();
 
