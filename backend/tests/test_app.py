@@ -421,17 +421,17 @@ def test_generation_passes_resolution_ratio_and_quality(tmp_path: Path) -> None:
 
         generated = client.post(
             "/api/images/generate",
-            json={"prompt": "wide city", "size": "2K", "aspect_ratio": "16:9", "quality": "high"},
+            json={"prompt": "wide city", "size": "2048x1152", "quality": "high"},
         )
 
         assert generated.status_code == 200
         task = wait_for_task(client, generated.json()["id"])
         item = task["items"][0]
         provider = client.app.state.provider
-        assert task["size"] == "2560x1440"
-        assert task["aspect_ratio"] == "16:9"
-        assert item["aspect_ratio"] == "16:9"
-        assert provider.generated_payloads[-1]["size"] == "2560x1440"
+        assert task["size"] == "2048x1152"
+        assert task["aspect_ratio"] == ""
+        assert item["aspect_ratio"] == ""
+        assert provider.generated_payloads[-1]["size"] == "2048x1152"
         assert "aspectRatio" not in provider.generated_payloads[-1]
         assert provider.generated_payloads[-1]["quality"] == "high"
 
@@ -479,7 +479,7 @@ def test_managed_user_ledger_uses_sub2api_actual_cost(tmp_path: Path) -> None:
 
         generated = client.post(
             "/api/images/generate",
-            json={"prompt": "managed billing", "size": "2K", "aspect_ratio": "1:1", "quality": "medium"},
+            json={"prompt": "managed billing", "size": "2K", "aspect_ratio": "3:2", "quality": "medium"},
         )
 
         assert generated.status_code == 200
@@ -500,7 +500,7 @@ def test_manual_override_ledger_keeps_estimated_cost(tmp_path: Path) -> None:
 
         generated = client.post(
             "/api/images/generate",
-            json={"prompt": "shared key billing", "size": "2K", "aspect_ratio": "1:1", "quality": "medium"},
+            json={"prompt": "shared key billing", "size": "2K", "aspect_ratio": "3:2", "quality": "medium"},
         )
 
         assert generated.status_code == 200
@@ -511,28 +511,32 @@ def test_manual_override_ledger_keeps_estimated_cost(tmp_path: Path) -> None:
 
 
 def test_image_size_presets_follow_provider_limits() -> None:
-    assert _provider_image_size("1K", "1:1") == "1088x1088"
-    assert _provider_image_size("1K", "16:9") == "2048x1152"
-    assert _provider_image_size("1K", "9:16") == "1152x2048"
-    assert _provider_image_size("1K", "3:2") == "1632x1088"
-    assert _provider_image_size("2K", "1:1") == "1440x1440"
-    assert _provider_image_size("2K", "16:9") == "2560x1440"
-    assert _provider_image_size("2K", "3:2") == "2160x1440"
+    assert _provider_image_size("1K", "1:1") == "1024x1024"
+    assert _provider_image_size("2K", "3:2") == "1536x1024"
+    assert _provider_image_size("2K", "2:3") == "1024x1536"
+    assert _provider_image_size("2K", "1:1") == "2048x2048"
+    assert _provider_image_size("2K", "16:9") == "2048x1152"
     assert _provider_image_size("4K", "16:9") == "3840x2160"
+    assert _provider_image_size("4K", "9:16") == "2160x3840"
+    assert _provider_image_size("1536x1024", "1:1") == "1536x1024"
+    assert _provider_image_size("2048x2048") == "2048x2048"
     with pytest.raises(HTTPException):
         _provider_image_size("576x1024", "9:16")
     with pytest.raises(HTTPException):
         _provider_image_size("1080x1920", "9:16")
+    with pytest.raises(HTTPException):
+        _provider_image_size("1K", "16:9")
+    with pytest.raises(HTTPException):
+        _provider_image_size("1792x1024", "7:4")
     with pytest.raises(HTTPException):
         _provider_image_size("4K", "1:1")
     with pytest.raises(HTTPException):
         _provider_image_size("3840x3840", "1:1")
     with pytest.raises(HTTPException):
         _provider_image_size("4096x4096", "1:1")
-    assert _image_size_tier("1088x1088") == "1K"
-    assert _image_size_tier("2048x1152") == "1K"
-    assert _image_size_tier("1440x1440") == "2K"
-    assert _image_size_tier("2560x1440") == "2K"
+    assert _image_size_tier("1024x1024") == "1K"
+    assert _image_size_tier("1536x1024") == "2K"
+    assert _image_size_tier("2048x2048") == "2K"
     assert _image_size_tier("2160x3840") == "4K"
 
 
@@ -871,7 +875,7 @@ def test_admin_can_update_global_upstream_settings(tmp_path: Path) -> None:
 
         generated = client.post(
             "/api/images/generate",
-            json={"prompt": "custom upstream", "size": "2K", "aspect_ratio": "1:1", "quality": "medium"},
+            json={"prompt": "custom upstream", "size": "2K", "aspect_ratio": "3:2", "quality": "medium"},
         )
         assert generated.status_code == 200
         wait_for_task(client, generated.json()["id"])

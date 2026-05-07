@@ -271,9 +271,13 @@ export default function Config() {
                     onChange={(event) => setConfig((current) => current && { ...current, default_size: event.target.value })}
                   />
                   <datalist id="image-size-options">
-                    <option value="1K" label="1K (1080p)" />
-                    <option value="2K" label="2K (1440p)" />
-                    <option value="4K" label="4K (2160p)" />
+                    <option value="1024x1024" label="1K / 正方形默认尺寸" />
+                    <option value="1536x1024" label="2K / 官方推荐横向 2K" />
+                    <option value="1024x1536" label="2K / 官方推荐纵向 2K" />
+                    <option value="2048x2048" label="2K / 原生正方形" />
+                    <option value="2048x1152" label="2K / 16:9 宽屏" />
+                    <option value="3840x2160" label="4K / 官方推荐最高规格横向" />
+                    <option value="2160x3840" label="4K / 官方推荐最高规格纵向" />
                   </datalist>
                 </>
               </Field>

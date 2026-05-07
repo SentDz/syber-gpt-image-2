@@ -50,36 +50,24 @@ class GenerateRequest(BaseModel):
 
 SIZE_PRESETS: dict[str, dict[str, str]] = {
     "1K": {
-        "1:1": "1088x1088",
-        "16:9": "2048x1152",
-        "9:16": "1152x2048",
-        "3:2": "1632x1088",
-        "2:3": "1088x1632",
-        "4:3": "1472x1104",
-        "3:4": "1104x1472",
+        "1:1": "1024x1024",
     },
     "2K": {
-        "1:1": "1440x1440",
-        "16:9": "2560x1440",
-        "9:16": "1440x2560",
-        "3:2": "2160x1440",
-        "2:3": "1440x2160",
-        "4:3": "1920x1440",
-        "3:4": "1440x1920",
+        "3:2": "1536x1024",
+        "2:3": "1024x1536",
+        "1:1": "2048x2048",
+        "16:9": "2048x1152",
     },
     "4K": {
         "16:9": "3840x2160",
         "9:16": "2160x3840",
-        "3:2": "3840x2560",
-        "2:3": "2560x3840",
-        "4:3": "3840x2880",
-        "3:4": "2880x3840",
     },
 }
 
 SIZE_TIER_BY_DIMENSION = {
     dimension.lower(): scale for scale, ratios in SIZE_PRESETS.items() for dimension in ratios.values()
 }
+SUPPORTED_IMAGE_DIMENSIONS = set(SIZE_TIER_BY_DIMENSION)
 
 RETRYABLE_PROVIDER_STATUS_CODES = {429, 502, 503, 504}
 IMAGE_PROVIDER_MAX_ATTEMPTS = 3
@@ -527,6 +515,16 @@ def create_app(
             updates.pop("api_key")
         if "base_url" in updates and updates["base_url"]:
             updates["base_url"] = updates["base_url"].rstrip("/")
+        if "default_size" in updates:
+            cleaned_size = str(updates["default_size"] or "").strip().replace("×", "x")
+            scale = cleaned_size.upper()
+            dimension = cleaned_size.lower()
+            if scale in SIZE_PRESETS:
+                updates["default_size"] = scale
+            elif dimension in SUPPORTED_IMAGE_DIMENSIONS:
+                updates["default_size"] = dimension
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
         config = db.update_config(viewer.owner_id, settings, updates)
         return _public_config(config, viewer)
 
@@ -1353,25 +1351,19 @@ def _image_payload(config: dict[str, Any], request: GenerateRequest) -> dict[str
 
 
 def _provider_image_size(size: str, aspect_ratio: str | None = None) -> str:
-    cleaned_size = str(size or "").strip()
+    cleaned_size = str(size or "").strip().replace("×", "x")
     scale = cleaned_size.upper()
-    ratio = str(aspect_ratio or "1:1").strip() or "1:1"
     if scale in SIZE_PRESETS:
+        ratio = str(aspect_ratio).strip() if aspect_ratio is not None else ""
+        if not ratio:
+            return next(iter(SIZE_PRESETS[scale].values()))
         if ratio not in SIZE_PRESETS[scale]:
             raise HTTPException(status_code=400, detail=f"Unsupported image size combination: {scale} {ratio}")
         return SIZE_PRESETS[scale][ratio]
-    dimension_parts = cleaned_size.lower().split("x")
-    if len(dimension_parts) == 2 and all(part.isdigit() for part in dimension_parts):
-        width, height = (int(part) for part in dimension_parts)
-        if width * height < 1024 * 1024:
-            raise HTTPException(status_code=400, detail=f"Unsupported image size below minimum pixel budget: {cleaned_size}")
-        if width % 16 != 0 or height % 16 != 0:
-            raise HTTPException(status_code=400, detail=f"Unsupported image size, width and height must be divisible by 16: {cleaned_size}")
-        if max(width, height) > 3840:
-            raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
-        if width == height and width > 2048:
-            raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
-    return cleaned_size
+    dimension = cleaned_size.lower()
+    if dimension in SUPPORTED_IMAGE_DIMENSIONS:
+        return dimension
+    raise HTTPException(status_code=400, detail=f"Unsupported image size: {cleaned_size}")
 
 
 def _image_size_tier(size: str) -> str:

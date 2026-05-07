@@ -20,43 +20,35 @@ import MasonryGrid from '../components/MasonryGrid';
 import { useSite } from '../site';
 import { useTasks } from '../tasks';
 
-const SIZE_OPTIONS = ['1K', '2K', '4K'];
-const SIZE_LABELS: Record<string, string> = {
-  '1K': '1K (1080p)',
-  '2K': '2K (1440p)',
-  '4K': '4K (2160p)',
-};
-const ASPECT_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
+const IMAGE_SIZE_OPTIONS = [
+  { value: '1024x1024', label: '1024×1024  1K / 正方形社交媒体头像、图标、标准卡片最常用默认尺寸，生成最快' },
+  { value: '1536x1024', label: '1536×1024  2K / 横向横幅、海报、演示文稿、产品展示官方推荐横向 2K' },
+  { value: '1024x1536', label: '1024×1536  2K / 纵向手机壁纸、故事、竖版海报官方推荐纵向 2K' },
+  { value: '2048x2048', label: '2048×2048  2K / 高清正方形海报、艺术图原生 2K 正方形' },
+  { value: '2048x1152', label: '2048×1152  2K / 横向 16:9 横幅、视频封面、宽屏经典 16:9 比例 2K' },
+  { value: '3840x2160', label: '3840×2160  4K / 横向超高清横幅、4K 壁纸、印刷官方推荐最高规格横向' },
+  { value: '2160x3840', label: '2160×3840  4K / 纵向手机 4K 壁纸、竖版超清官方推荐最高规格纵向' },
+];
+const IMAGE_SIZE_VALUES = IMAGE_SIZE_OPTIONS.map((option) => option.value);
+const IMAGE_SIZE_LABELS = Object.fromEntries(IMAGE_SIZE_OPTIONS.map((option) => [option.value, option.label]));
+const DEFAULT_IMAGE_SIZE = '1536x1024';
 const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
 const BATCH_COUNT_OPTIONS = ['1', '2', '3'];
 const BATCH_SUBMIT_DELAY_MS = 2000;
 const CASE_SORT_OPTIONS: CaseSort[] = ['latest', 'likes', 'comments'];
 const SIZE_PRESETS: Record<string, Record<string, string>> = {
   '1K': {
-    '1:1': '1088x1088',
-    '16:9': '2048x1152',
-    '9:16': '1152x2048',
-    '3:2': '1632x1088',
-    '2:3': '1088x1632',
-    '4:3': '1472x1104',
-    '3:4': '1104x1472',
+    '1:1': '1024x1024',
   },
   '2K': {
-    '1:1': '1440x1440',
-    '16:9': '2560x1440',
-    '9:16': '1440x2560',
-    '3:2': '2160x1440',
-    '2:3': '1440x2160',
-    '4:3': '1920x1440',
-    '3:4': '1440x1920',
+    '3:2': '1536x1024',
+    '2:3': '1024x1536',
+    '1:1': '2048x2048',
+    '16:9': '2048x1152',
   },
   '4K': {
     '16:9': '3840x2160',
     '9:16': '2160x3840',
-    '3:2': '3840x2560',
-    '2:3': '2560x3840',
-    '4:3': '3840x2880',
-    '3:4': '2880x3840',
   },
 };
 const SIZE_BY_PRESET_VALUE = Object.fromEntries(
@@ -77,8 +69,7 @@ export default function Home() {
   const [cases, setCases] = useState<CaseItem[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [selectedPreviews, setSelectedPreviews] = useState<{ id: string; name: string; url: string }[]>([]);
-  const [imageScale, setImageScale] = useState('2K');
-  const [aspectRatio, setAspectRatio] = useState('1:1');
+  const [imageSize, setImageSize] = useState(DEFAULT_IMAGE_SIZE);
   const [imageQuality, setImageQuality] = useState('auto');
   const [batchCount, setBatchCount] = useState('1');
   const [keyGroups, setKeyGroups] = useState<AuthKeyGroup[]>([]);
@@ -115,7 +106,7 @@ export default function Home() {
     getConfig()
       .then((config) => {
         if (cancelled) return;
-        setImageScale(normalizeImageScale(config.default_size));
+        setImageSize(normalizeImageSize(config.default_size));
         setImageQuality(config.default_quality || 'auto');
       })
       .catch(() => undefined);
@@ -150,12 +141,6 @@ export default function Home() {
       cancelled = true;
     };
   }, [viewer?.authenticated, viewer?.owner_id]);
-
-  useEffect(() => {
-    if (!isSupportedImagePreset(imageScale, aspectRatio)) {
-      setImageScale('2K');
-    }
-  }, [aspectRatio, imageScale]);
 
   useEffect(() => {
     setLoadingMoreFeed(false);
@@ -207,8 +192,7 @@ export default function Home() {
     const submitCount = isEditMode ? 1 : Math.max(1, Math.min(3, Number(batchCount) || 1));
     setMessage(isEditMode ? t('home_message_edit_sent') : t('home_message_generate_sent'));
     const imageOptions = {
-      size: providerImageSize(imageScale, aspectRatio),
-      aspect_ratio: aspectRatio,
+      size: imageSize,
       quality: imageQuality,
     };
     let submittedCount = 0;
@@ -282,12 +266,6 @@ export default function Home() {
       replaceCase(next);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-  const handleAspectRatioChange = (nextRatio: string) => {
-    setAspectRatio(nextRatio);
-    if (nextRatio === '1:1' && imageScale === '4K') {
-      setImageScale('2K');
     }
   };
   const handleReferenceImages = (event: ChangeEvent<HTMLInputElement>) => {
@@ -467,9 +445,8 @@ export default function Home() {
              <span className="w-2 h-2 bg-secondary rounded-full animate-pulse"></span> {t('home_mode')}: {selectedFiles.length ? t('home_mode_edit') : t('home_mode_generate')}
           </div>
           <div className="hidden items-center gap-2 text-[10px] uppercase tracking-widest text-white/45 md:flex">
-            <span>{SIZE_LABELS[imageScale] || imageScale}</span>
-            <span>{aspectRatio}</span>
-            <span>{providerImageSize(imageScale, aspectRatio)}</span>
+            <span>{formatImageSize(imageSize)}</span>
+            <span>{SIZE_BY_PRESET_VALUE[imageSize.toUpperCase()] || '2K'}</span>
             <span>{imageQuality}</span>
           </div>
           {viewer?.authenticated ? (
@@ -507,16 +484,14 @@ export default function Home() {
           </div>
         </div>
 
-        <div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+        <div className="mb-4 grid grid-cols-1 gap-2 md:grid-cols-3">
           <GenerationSelect
             label={t('home_size')}
-            value={imageScale}
-            onChange={setImageScale}
-            options={SIZE_OPTIONS}
-            getOptionLabel={(option) => SIZE_LABELS[option] || option}
-            isOptionDisabled={(option) => !isSupportedImagePreset(option, aspectRatio)}
+            value={imageSize}
+            onChange={setImageSize}
+            options={IMAGE_SIZE_VALUES}
+            getOptionLabel={(option) => IMAGE_SIZE_LABELS[option] || option}
           />
-          <GenerationSelect label={t('home_aspect_ratio')} value={aspectRatio} onChange={handleAspectRatioChange} options={ASPECT_RATIO_OPTIONS} />
           <GenerationSelect label={t('home_quality')} value={imageQuality} onChange={setImageQuality} options={QUALITY_OPTIONS} />
           <GenerationSelect
             label={t('home_batch_count')}
@@ -647,32 +622,27 @@ function GenerationSelect({
   );
 }
 
-function normalizeImageScale(value: string | undefined) {
-  const normalized = (value || '').trim().toUpperCase();
-  if (SIZE_OPTIONS.includes(normalized)) {
-    return normalized;
+function normalizeImageSize(value: string | undefined) {
+  const normalized = (value || '').trim().replace('×', 'x').toUpperCase();
+  const exactSize = IMAGE_SIZE_VALUES.find((size) => size.toUpperCase() === normalized);
+  if (exactSize) {
+    return exactSize;
   }
   if (SIZE_BY_PRESET_VALUE[normalized]) {
-    return SIZE_BY_PRESET_VALUE[normalized];
+    return exactSizeByPresetValue(normalized);
   }
-  if (/^1\d{3}x1\d{3}$/i.test(normalized)) {
-    return '1K';
+  if (normalized in SIZE_PRESETS) {
+    return Object.values(SIZE_PRESETS[normalized])[0];
   }
-  if (/^2\d{3}x|x2\d{3}$/i.test(normalized)) {
-    return '2K';
-  }
-  if (/^[34]\d{3}x|x[34]\d{3}$/i.test(normalized)) {
-    return '4K';
-  }
-  return '2K';
+  return DEFAULT_IMAGE_SIZE;
 }
 
-function providerImageSize(scale: string, ratio: string) {
-  return SIZE_PRESETS[scale]?.[ratio] || SIZE_PRESETS['2K']['1:1'];
+function exactSizeByPresetValue(normalized: string) {
+  return IMAGE_SIZE_VALUES.find((size) => size.toUpperCase() === normalized) || DEFAULT_IMAGE_SIZE;
 }
 
-function isSupportedImagePreset(scale: string, ratio: string) {
-  return Boolean(SIZE_PRESETS[scale]?.[ratio]);
+function formatImageSize(size: string) {
+  return size.replace('x', '×');
 }
 
 function caseSortLabel(sort: CaseSort, t: ReturnType<typeof useSite>['t']) {
