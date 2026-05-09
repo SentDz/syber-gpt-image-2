@@ -1903,7 +1903,8 @@ def _json_load(value: str | None) -> Any:
 def _history_row(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["usage"] = _json_load(data.pop("usage_json"))
-    data["provider_response"] = _json_load(data.pop("provider_response_json"))
+    data.pop("provider_response_json", None)
+    data["provider_response"] = None
     data["published_case_id"] = data.get("published_case_id")
     data["published_inspiration_id"] = data["published_case_id"]
     data["published_at"] = data.get("published_at")
